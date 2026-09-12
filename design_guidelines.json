@@ -1,0 +1,168 @@
+{
+  "app_name": "ShriMusic",
+  "personality": "7 Dark-First Utility DARK",
+  "personality_one_liner": "A sleek, high-performance, Spotify-inspired music streaming command center engineered for instant playback and immersive audio experiences.",
+  "color": {
+    "surface": "#121212",
+    "onSurface": "#FFFFFF",
+    "surfaceSecondary": "#282828",
+    "onSurfaceSecondary": "#B3B3B3",
+    "surfaceTertiary": "#333333",
+    "onSurfaceTertiary": "#FFFFFF",
+    "surfaceInverse": "#FFFFFF",
+    "onSurfaceInverse": "#121212",
+    "brand": "#1DB954",
+    "brandPrimary": "#1DB954",
+    "onBrandPrimary": "#FFFFFF",
+    "brandSecondary": "#169C46",
+    "onBrandSecondary": "#FFFFFF",
+    "brandTertiary": "#1Fdf64",
+    "onBrandTertiary": "#121212",
+    "success": "#1DB954",
+    "onSuccess": "#FFFFFF",
+    "warning": "#FFA726",
+    "onWarning": "#121212",
+    "error": "#E53935",
+    "onError": "#FFFFFF",
+    "info": "#29B6F6",
+    "onInfo": "#121212",
+    "border": "#282828",
+    "borderStrong": "#1DB954",
+    "divider": "#222222",
+    "muted": "#B3B3B3",
+    "onBrand": "#FFFFFF"
+  },
+  "typography": {
+    "displayFontFamily": "System",
+    "textFontFamily": "System",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Generous vertical breathing room with compact module spacing for fast media scanning",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 6,
+    "md": 12,
+    "lg": 20,
+    "pill": 999
+  },
+  "shadow_tier": "1",
+  "navigation": "bottom_tabs",
+  "icon_set": "MaterialCommunityIcons",
+  "glassmorphism": {
+    "enabled": "true",
+    "do's": [
+      "Use translucent frosted glass for bottom mini-player and sticky header overlays",
+      "Ensure 75%+ surface tint for optimal contrast over scrolling album grids"
+    ],
+    "dont's": [
+      "Do not blur form inputs or active modal sheets",
+      "Do not stack more than two blur layers on a single screen"
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-glass-effect",
+      "android": "expo-blur",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "screens": [
+    {
+      "name": "Auth",
+      "purpose": "Secure authentication supporting custom email/password, Google Sign-in, and Invidious/Piped endpoint configuration.",
+      "states": {
+        "loading": "Authenticating credentials and verifying endpoint connection...",
+        "empty": "Enter your credentials or configure your custom music provider endpoint.",
+        "error": "Authentication failed or endpoint unreachable. Please verify network and keys."
+      },
+      "layout": "Centered immersive card with Spotify Green primary button, email/password inputs, Google SSO pill, and settings trigger for custom API endpoint configuration."
+    },
+    {
+      "name": "Home",
+      "purpose": "Discovery hub featuring recently played, personalized mix recommendations, and quick-access top tracks.",
+      "states": {
+        "loading": "Curating your personalized music feed...",
+        "empty": "No recent listening history. Start exploring top charts or search for your favorite artists.",
+        "error": "Unable to fetch music discovery feed. Tap to retry connection."
+      },
+      "layout": "Vertical scroll with top greeting header, horizontal quick-access grid of 6 recently played items, followed by vertical carousels of featured albums and curated playlists."
+    },
+    {
+      "name": "Search",
+      "purpose": "Global discovery and categorization search for songs, artists, albums, and playlists with instant autocomplete.",
+      "states": {
+        "loading": "Searching music database...",
+        "empty": "No tracks or artists found matching your query.",
+        "error": "Search service unavailable. Check your custom endpoint connection."
+      },
+      "layout": "Top sticky search bar with filter chips (Songs, Artists, Playlists, Albums), transitioning from zero-state category exploration cards to live autocomplete result lists."
+    },
+    {
+      "name": "Library",
+      "purpose": "Local persistent music library managing custom playlists, favorites, followed artists, and offline downloads.",
+      "states": {
+        "loading": "Loading your saved music library...",
+        "empty": "Your library is empty. Save songs, albums, or create playlists to build your collection.",
+        "error": "Failed to sync local library data. Tap to reload."
+      },
+      "layout": "Header with user avatar and filter pills (Playlists, Artists, Downloaded), sorting dropdown, and a vertical list of saved items with thumbnail art and action triggers."
+    },
+    {
+      "name": "Player",
+      "purpose": "Full-screen media player featuring real-time synchronized LRC lyrics, playback controls, equalizer, and sleep timer.",
+      "states": {
+        "loading": "Buffering audio stream and loading lyrics...",
+        "empty": "No track currently loaded.",
+        "error": "Playback error encountered. Please check network or switch Invidious endpoint."
+      },
+      "layout": "Full bleed album art backdrop with gradient scrim, track title and artist metadata, interactive seek bar, primary playback controls, and sliding lyric view."
+    },
+    {
+      "name": "Settings",
+      "purpose": "Configuration hub for Invidious/Piped API endpoints, audio quality, theme switching, and equalizer presets.",
+      "states": {
+        "loading": "Loading configuration settings...",
+        "empty": "No settings available.",
+        "error": "Failed to save configuration changes."
+      },
+      "layout": "Structured vertical settings list grouped by Audio Streaming, Custom Endpoints & Keys, Themes & Appearance, and Account Management."
+    }
+  ],
+  "images": {
+    "hero_album": {
+      "url": "https://images.unsplash.com/photo-1617722694278-84453e1719a8?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MDZ8MHwxfHNlYXJjaHwxfHxzcG90aWZ5JTIwbXVzaWMlMjBhbGJ1bSUyMGNvdmVyJTIwYXJ0JTIwZGFyayUyMHRoZW1lJTIwdmlueWx8ZW58MHx8fHwxNzg5MTkwNDM4fDA&ixlib=rb-4.1.0&q=85",
+      "dark": "https://images.unsplash.com/photo-1617722694278-84453e1719a8?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MDZ8MHwxfHNlYXJjaHwxfHxzcG90aWZ5JTIwbXVzaWMlMjBhbGJ1bSUyMGNvdmVyJTIwYXJ0JTIwZGFyayUyMHRoZW1lJTIwdmlueWx8ZW58MHx8fHwxNzg5MTkwNDM4fDA&ixlib=rb-4.1.0&q=85",
+      "alt": "Spotify dark theme album art cover"
+    },
+    "app_logo": {
+      "url": "https://images.unsplash.com/photo-1617722694278-84453e1719a8?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MDZ8MHwxfHNlYXJjaHwxfHxzcG90aWZ5JTIwbXVzaWMlMjBhbGJ1bSUyMGNvdmVyJTIwYXJ0JTIwZGFyayUyMHRoZW1lJTIwdmlueWx8ZW58MHx8fHwxNzg5MTkwNDM4fDA&ixlib=rb-4.1.0&q=85",
+      "alt": "ShriMusic Brand Logo"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Implement ShriMusic with a sleek Spotify-inspired dark theme (#121212 canvas, #282828 elevated cards, #1DB954 Spotify Green accent).",
+    "Provide bottom navigation tabs (Home, Search, Library, Settings) with a sticky mini-player above the tab bar for persistent background audio control.",
+    "Build a robust custom endpoint configuration screen for Invidious/Piped/YouTube API keys and fallback instances.",
+    "Ensure full support for Auth (Email/Password + Google Sign-In) and a full-screen player with synced LRCLIB lyrics.",
+    "Comply strictly with design guidelines: touch targets >= 44x44pt, safe area handling, gradient scrims on imagery, and zero forbidden purple/indigo hues."
+  ]
+}
