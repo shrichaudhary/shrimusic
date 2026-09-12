@@ -10,8 +10,10 @@ import { apiRequest } from "@/src/api";
 import { useAuth } from "@/src/auth";
 import { AddToPlaylistSheet } from "@/src/components/add-to-playlist-sheet";
 import { AlbumArt } from "@/src/components/album-art";
+import { CatalogueScreen } from "@/src/components/catalogue-screen";
 import { PlayerSheet, PlayerTrack } from "@/src/components/player-sheet";
 import { PlaylistDetail } from "@/src/components/playlist-detail";
+import { QueueSheet } from "@/src/components/queue-sheet";
 import { makeStyles, setColorScheme, useTheme } from "@/src/theme";
 import { DownloadedTrack, isDownloaded, listDownloads } from "@/src/utils/downloads";
 
@@ -49,6 +51,8 @@ export function MainApp() {
   const [addToPlaylistTrack, setAddToPlaylistTrack] = useState<Track | null>(null);
   const [openedPlaylist, setOpenedPlaylist] = useState<Playlist | null>(null);
   const [downloads, setDownloads] = useState<DownloadedTrack[]>([]);
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [openedCatalogue, setOpenedCatalogue] = useState<{ kind: "artist" | "album"; name: string; art?: string | null } | null>(null);
 
   const player = useAudioPlayer(track?.stream_url ?? undefined);
   const playerStatus = useAudioPlayerStatus(player);
@@ -153,6 +157,60 @@ export function MainApp() {
     void playTrack(queue[prev], queue);
   }, [queueIndex, queue, playTrack]);
 
+  const shuffleQueue = useCallback(() => {
+    if (queue.length <= 1) return;
+    const rest = queue.filter((_, i) => i !== queueIndex);
+    for (let i = rest.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [rest[i], rest[j]] = [rest[j], rest[i]];
+    }
+    const current = queue[queueIndex];
+    const next = current ? [current, ...rest] : rest;
+    setQueue(next);
+    setQueueIndex(current ? 0 : -1);
+  }, [queue, queueIndex]);
+
+  const clearQueue = useCallback(() => {
+    if (queueIndex < 0) {
+      setQueue([]);
+      setQueueIndex(-1);
+      return;
+    }
+    // Keep the currently-playing track so audio doesn't stop mid-song.
+    const current = queue[queueIndex];
+    setQueue(current ? [current] : []);
+    setQueueIndex(current ? 0 : -1);
+  }, [queue, queueIndex]);
+
+  const reorderQueue = useCallback(
+    (next: Track[]) => {
+      const currentId = queueIndex >= 0 ? queue[queueIndex]?.id : null;
+      const nextIndex = currentId ? next.findIndex((t) => t.id === currentId) : -1;
+      setQueue(next);
+      setQueueIndex(nextIndex);
+    },
+    [queue, queueIndex],
+  );
+
+  const jumpTo = useCallback(
+    (index: number) => {
+      if (index < 0 || index >= queue.length) return;
+      void playTrack(queue[index], queue);
+    },
+    [queue, playTrack],
+  );
+
+  const removeFromQueue = useCallback(
+    (index: number) => {
+      if (index < 0 || index >= queue.length || index === queueIndex) return;
+      const next = queue.filter((_, i) => i !== index);
+      const nextIndex = index < queueIndex ? queueIndex - 1 : queueIndex;
+      setQueue(next);
+      setQueueIndex(nextIndex);
+    },
+    [queue, queueIndex],
+  );
+
   const toggleLike = useCallback(
     async (item: Track) => {
       const isLiked = likedIds.has(item.id);
@@ -205,6 +263,70 @@ export function MainApp() {
   const setSleepMinutes = (minutes: number) => setSleepRemainingSeconds(minutes * 60);
 
   // If a playlist is opened, render its detail full-screen inside the main shell
+  const openArtist = (artistName: string, art?: string | null) => setOpenedCatalogue({ kind: "artist", name: artistName, art });
+
+  const overlays = (
+    <>
+      {playerOpen ? (
+        <PlayerSheet
+          track={track}
+          playing={playerStatus.playing}
+          currentTime={playerStatus.currentTime ?? 0}
+          duration={playerStatus.duration || track?.duration_seconds || 0}
+          liked={track ? likedIds.has(track.id) : false}
+          hasQueue={queue.length > 1}
+          onToggle={togglePlayback}
+          onSeek={(sec) => {
+            try {
+              player.seekTo(sec);
+            } catch {
+              // ignore
+            }
+          }}
+          onClose={() => setPlayerOpen(false)}
+          onLike={() => track && void toggleLike(track)}
+          onNext={playNext}
+          onPrev={playPrev}
+          onAddToPlaylist={() => track && setAddToPlaylistTrack(track)}
+          onOpenQueue={() => setQueueOpen(true)}
+        />
+      ) : null}
+      {queueOpen ? (
+        <QueueSheet
+          queue={queue}
+          currentIndex={queueIndex}
+          onClose={() => setQueueOpen(false)}
+          onReorder={reorderQueue}
+          onShuffle={shuffleQueue}
+          onClear={clearQueue}
+          onJumpTo={jumpTo}
+          onRemove={removeFromQueue}
+        />
+      ) : null}
+      {addToPlaylistTrack ? (
+        <AddToPlaylistSheet track={addToPlaylistTrack} onClose={() => setAddToPlaylistTrack(null)} />
+      ) : null}
+    </>
+  );
+
+  if (openedCatalogue) {
+    return (
+      <View style={styles.root}>
+        <CatalogueScreen
+          kind={openedCatalogue.kind}
+          name={openedCatalogue.name}
+          seedArtUrl={openedCatalogue.art}
+          onBack={() => setOpenedCatalogue(null)}
+          onPlay={(t, ctx) => void playTrack(t, ctx)}
+          resolvingId={resolving}
+          onOpenArtist={openArtist}
+        />
+        <MiniPlayer track={track} playing={playerStatus.playing} onOpen={() => setPlayerOpen(true)} onToggle={togglePlayback} bottom={insets.bottom + 12} />
+        {overlays}
+      </View>
+    );
+  }
+
   if (openedPlaylist) {
     return (
       <View style={styles.root}>
@@ -216,41 +338,16 @@ export function MainApp() {
           resolvingId={resolving}
         />
         <MiniPlayer track={track} playing={playerStatus.playing} onOpen={() => setPlayerOpen(true)} onToggle={togglePlayback} bottom={insets.bottom + 12} />
-        {playerOpen ? (
-          <PlayerSheet
-            track={track}
-            playing={playerStatus.playing}
-            currentTime={playerStatus.currentTime ?? 0}
-            duration={playerStatus.duration || track?.duration_seconds || 0}
-            liked={track ? likedIds.has(track.id) : false}
-            hasQueue={queue.length > 1}
-            onToggle={togglePlayback}
-            onSeek={(sec) => {
-              try {
-                player.seekTo(sec);
-              } catch {
-                // ignore
-              }
-            }}
-            onClose={() => setPlayerOpen(false)}
-            onLike={() => track && void toggleLike(track)}
-            onNext={playNext}
-            onPrev={playPrev}
-            onAddToPlaylist={() => track && setAddToPlaylistTrack(track)}
-          />
-        ) : null}
-        {addToPlaylistTrack ? (
-          <AddToPlaylistSheet track={addToPlaylistTrack} onClose={() => setAddToPlaylistTrack(null)} />
-        ) : null}
+        {overlays}
       </View>
     );
   }
 
   const content =
     tab === "Home" ? (
-      <HomeScreen userName={user?.name ?? "Listener"} onPlay={playTrack} resolvingId={resolving} likedIds={likedIds} onLike={toggleLike} onAdd={setAddToPlaylistTrack} />
+      <HomeScreen userName={user?.name ?? "Listener"} onPlay={playTrack} resolvingId={resolving} likedIds={likedIds} onLike={toggleLike} onAdd={setAddToPlaylistTrack} onArtistPress={openArtist} />
     ) : tab === "Search" ? (
-      <SearchScreen onPlay={playTrack} resolvingId={resolving} likedIds={likedIds} onLike={toggleLike} onAdd={setAddToPlaylistTrack} />
+      <SearchScreen onPlay={playTrack} resolvingId={resolving} likedIds={likedIds} onLike={toggleLike} onAdd={setAddToPlaylistTrack} onArtistPress={openArtist} />
     ) : tab === "Library" ? (
       <LibraryScreen
         onPlay={playTrack}
@@ -301,6 +398,19 @@ export function MainApp() {
           onNext={playNext}
           onPrev={playPrev}
           onAddToPlaylist={() => track && setAddToPlaylistTrack(track)}
+          onOpenQueue={() => setQueueOpen(true)}
+        />
+      ) : null}
+      {queueOpen ? (
+        <QueueSheet
+          queue={queue}
+          currentIndex={queueIndex}
+          onClose={() => setQueueOpen(false)}
+          onReorder={reorderQueue}
+          onShuffle={shuffleQueue}
+          onClear={clearQueue}
+          onJumpTo={jumpTo}
+          onRemove={removeFromQueue}
         />
       ) : null}
       {addToPlaylistTrack ? (
@@ -329,8 +439,8 @@ function MiniPlayer({ track, playing, onOpen, onToggle, bottom, disabled }: { tr
   );
 }
 
-type TrackRowProps = { item: Track; onPlay: (t: Track) => void; resolvingId: string | null; liked: boolean; onLike?: (t: Track) => void; onAdd?: (t: Track) => void };
-function TrackRow({ item, onPlay, resolvingId, liked, onLike, onAdd }: TrackRowProps) {
+type TrackRowProps = { item: Track; onPlay: (t: Track) => void; resolvingId: string | null; liked: boolean; onLike?: (t: Track) => void; onAdd?: (t: Track) => void; onArtistPress?: (artist: string, art?: string | null) => void };
+function TrackRow({ item, onPlay, resolvingId, liked, onLike, onAdd, onArtistPress }: TrackRowProps) {
   const { colors } = useTheme();
   const styles = useStyles();
   const busy = resolvingId === item.id;
@@ -340,7 +450,13 @@ function TrackRow({ item, onPlay, resolvingId, liked, onLike, onAdd }: TrackRowP
         <AlbumArt size={52} icon="music-note" url={item.art_url} />
         <View style={styles.trackCopy}>
           <Text numberOfLines={1} style={styles.trackTitle}>{item.title || "Untitled"}</Text>
-          <Text numberOfLines={1} style={styles.trackArtist}>{item.artist || "Unknown"}</Text>
+          {onArtistPress && item.artist ? (
+            <Pressable testID={`track-artist-${item.id}`} hitSlop={4} onPress={() => onArtistPress(item.artist, item.art_url)}>
+              <Text numberOfLines={1} style={[styles.trackArtist, { textDecorationLine: "underline" }]}>{item.artist}</Text>
+            </Pressable>
+          ) : (
+            <Text numberOfLines={1} style={styles.trackArtist}>{item.artist || "Unknown"}</Text>
+          )}
         </View>
         {busy ? <ActivityIndicator color={colors.brandPrimary} /> : <MaterialCommunityIcons name="play-circle" size={26} color={colors.brandPrimary} />}
       </Pressable>
@@ -358,7 +474,7 @@ function TrackRow({ item, onPlay, resolvingId, liked, onLike, onAdd }: TrackRowP
   );
 }
 
-function HomeScreen({ userName, onPlay, resolvingId, likedIds, onLike, onAdd }: { userName: string; onPlay: (t: Track, ctx?: Track[]) => void; resolvingId: string | null; likedIds: Set<string>; onLike: (t: Track) => void; onAdd: (t: Track) => void }) {
+function HomeScreen({ userName, onPlay, resolvingId, likedIds, onLike, onAdd, onArtistPress }: { userName: string; onPlay: (t: Track, ctx?: Track[]) => void; resolvingId: string | null; likedIds: Set<string>; onLike: (t: Track) => void; onAdd: (t: Track) => void; onArtistPress: (artist: string, art?: string | null) => void }) {
   const { colors } = useTheme();
   const styles = useStyles();
   const [feed, setFeed] = useState<Track[]>([]);
@@ -407,7 +523,7 @@ function HomeScreen({ userName, onPlay, resolvingId, likedIds, onLike, onAdd }: 
       ) : feed.length ? (
         <View style={styles.trackList}>
           {feed.slice(0, 15).map((item) => (
-            <TrackRow key={item.id} item={item} onPlay={(t) => onPlay(t, feed)} resolvingId={resolvingId} liked={likedIds.has(item.id)} onLike={onLike} onAdd={onAdd} />
+            <TrackRow key={item.id} item={item} onPlay={(t) => onPlay(t, feed)} resolvingId={resolvingId} liked={likedIds.has(item.id)} onLike={onLike} onAdd={onAdd} onArtistPress={onArtistPress} />
           ))}
         </View>
       ) : (
@@ -420,7 +536,7 @@ function HomeScreen({ userName, onPlay, resolvingId, likedIds, onLike, onAdd }: 
   );
 }
 
-function SearchScreen({ onPlay, resolvingId, likedIds, onLike, onAdd }: { onPlay: (t: Track, ctx?: Track[]) => void; resolvingId: string | null; likedIds: Set<string>; onLike: (t: Track) => void; onAdd: (t: Track) => void }) {
+function SearchScreen({ onPlay, resolvingId, likedIds, onLike, onAdd, onArtistPress }: { onPlay: (t: Track, ctx?: Track[]) => void; resolvingId: string | null; likedIds: Set<string>; onLike: (t: Track) => void; onAdd: (t: Track) => void; onArtistPress: (artist: string, art?: string | null) => void }) {
   const { colors } = useTheme();
   const styles = useStyles();
   const [query, setQuery] = useState("");
@@ -456,7 +572,7 @@ function SearchScreen({ onPlay, resolvingId, likedIds, onLike, onAdd }: { onPlay
       ) : tracks.length ? (
         <View style={styles.trackList}>
           {tracks.map((item) => (
-            <TrackRow key={item.id} item={item} onPlay={(t) => onPlay(t, tracks)} resolvingId={resolvingId} liked={likedIds.has(item.id)} onLike={onLike} onAdd={onAdd} />
+            <TrackRow key={item.id} item={item} onPlay={(t) => onPlay(t, tracks)} resolvingId={resolvingId} liked={likedIds.has(item.id)} onLike={onLike} onAdd={onAdd} onArtistPress={onArtistPress} />
           ))}
         </View>
       ) : (

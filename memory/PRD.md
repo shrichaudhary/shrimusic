@@ -14,16 +14,18 @@ Spotify-inspired Expo mobile music streaming app powered by YouTube Music, Fireb
   - `users/{uid}/playlists/{playlist_id}` with `tracks/{id}` subcollection (has `order` field for drag-reorder)
 
 ## Delivered so far
-- Custom app icon + splash + in-app logo header (from user-provided artwork).
+- Custom app icon + splash + in-app logo header.
 - Firebase Email/Password auth (seeded test account: `preview.listener@example.com` / `ShriMusic@123`).
-- Real YouTube Music search & home feed (WEB_REMIX Innertube).
+- Real YouTube Music search & home feed (WEB_REMIX Innertube) with clean artist labels.
 - Direct audio streaming via `yt-dlp`, played through `expo-audio` with lock-screen metadata.
-- **Real progress bar** with drag-to-seek, live time display, next/previous through the current queue.
-- **Synced lyrics tab** — LRCLIB primary with KuGou fallback, auto-scrolling to the active line, in-memory cache.
-- **Offline downloads** — `expo-file-system` saves stream URL to `documentDirectory/shrimusic_downloads/`, manifest in SecureStore, offline playback via local file:// URI, "Downloads" section in Library.
-- **Playlist editor** — create + add via long-press on any track (bottom sheet), open playlist detail with drag-to-reorder (`react-native-draggable-flatlist`), remove tracks, delete playlist.
+- Real progress bar with drag-to-seek and live time display.
+- Synced LRCLIB/KuGou lyrics with auto-scroll and in-memory cache.
+- Offline downloads with local playback and Library "Downloads" section.
+- Playlist editor: bottom-sheet add, drag-to-reorder detail, remove tracks.
+- **Play queue sheet** — swipeable up-next list, drag-to-reorder, shuffle, clear, tap-to-jump.
+- **Artist / album detail pages** — tap any artist name to open a hero page with top tracks, Play-all, Shuffle.
 - Firestore-backed liked songs, history, playlists.
-- Sleep timer (Off / 15 / 30 / 60 min), light + dark theme, provider override for Piped/Invidious.
+- Sleep timer, light + dark theme, Piped/Invidious provider override.
 
 ## Backlog
 - P1: Google Sign-In in native builds (needs deployed Android build using google-services.json).

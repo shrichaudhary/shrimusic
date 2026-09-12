@@ -29,6 +29,7 @@ type Props = {
   onNext: () => void;
   onPrev: () => void;
   onAddToPlaylist: () => void;
+  onOpenQueue: () => void;
 };
 
 function formatTime(seconds: number): string {
@@ -39,7 +40,7 @@ function formatTime(seconds: number): string {
 }
 
 export function PlayerSheet(props: Props) {
-  const { track, playing, currentTime, duration, liked, hasQueue, onToggle, onSeek, onClose, onLike, onNext, onPrev, onAddToPlaylist } = props;
+  const { track, playing, currentTime, duration, liked, hasQueue, onToggle, onSeek, onClose, onLike, onNext, onPrev, onAddToPlaylist, onOpenQueue } = props;
   const { colors } = useTheme();
   const styles = useStyles();
   const [showLyrics, setShowLyrics] = useState(false);
@@ -154,9 +155,9 @@ export function PlayerSheet(props: Props) {
           <MaterialCommunityIcons name="chevron-down" size={28} color={colors.onSurface} />
         </Pressable>
         <Text style={styles.topText}>NOW PLAYING</Text>
-        <View style={styles.iconButton}>
-          {download ? <MaterialCommunityIcons name="download-circle" size={20} color={colors.brandPrimary} /> : null}
-        </View>
+        <Pressable testID="player-queue" onPress={onOpenQueue} accessibilityRole="button" style={styles.iconButton}>
+          <MaterialCommunityIcons name="playlist-play" size={24} color={colors.onSurface} />
+        </Pressable>
       </View>
 
       <View style={styles.body}>
