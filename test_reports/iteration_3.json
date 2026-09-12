@@ -1,0 +1,49 @@
+{
+  "summary": "Backend-only iteration. Full contract suite (13 pytest cases) executed against https://music-streaming-dev-1.preview.emergentagent.com with a real Firebase ID token minted via identitytoolkit signInWithPassword using the seeded preview.listener@example.com account. All 13 tests pass, covering health, auth (me/register+409/sync), provider (GET/PUT), music (home/search/stream via yt-dlp), library liked (POST/GET/DELETE), history (POST/GET), playlists (GET/POST/GET), and 401 auth failure paths (missing and invalid Bearer). yt-dlp stream extraction returned a valid stream_url with duration_seconds > 0 within timeout. No deprecated Expo packages inspected (backend-only scope).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "POST /api/auth/register",
+        "issue": "On Firebase policy violations (e.g. password missing non-alphanumeric char per this project's policy) the endpoint returns a generic 400 'Could not create account' without surfacing the specific requirement. Consider mapping firebase_admin ValueError/HTTP messages (PASSWORD_DOES_NOT_MEET_REQUIREMENTS, WEAK_PASSWORD, INVALID_EMAIL) to descriptive 400 responses so the mobile client can show actionable errors."
+      },
+      {
+        "endpoint": "POST /api/auth/register",
+        "issue": "Firebase lowercases emails on account creation, so the response body echoes the normalized email. Docs/clients should not assume case is preserved. Not a bug, worth noting for the frontend."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_shrimusic_backend.py",
+    "/app/test_reports/pytest/iteration_3.xml"
+  ],
+  "action_items": [
+    "(Optional) Map Firebase auth error codes to descriptive 400 responses in POST /api/auth/register so the client can display 'Password must contain a symbol', 'Weak password', 'Invalid email', etc.",
+    "(Optional) Document in README/frontend that Firebase normalizes email to lowercase on register."
+  ],
+  "critical_code_review_comments": [
+    "server.py registers a legacy @app.on_event('startup') handler; FastAPI recommends the lifespan context manager in current versions. Non-blocking but will show a DeprecationWarning.",
+    "verify_id_token uses check_revoked=False; acceptable per comment, but note that revocation/disable of a user is not detected until the token naturally expires (1h).",
+    "In POST /api/library/playlists/{playlist_id}/tracks the track_count increment reads-modify-writes without a Firestore transaction; concurrent adds can undercount. Use firestore.Increment(1) or a transaction.",
+    "youtube_client._context() hardcodes CLIENT_NAME=WEB_REMIX / CLIENT_VERSION even though .env exposes YOUTUBE_INNERTUBE_CLIENT / YOUTUBE_INNERTUBE_CLIENT_VERSION. Env values are unused. Either wire them up or drop from .env to avoid drift.",
+    "yt-dlp is called synchronously inside a thread with no per-request cache; repeated /music/stream/{id} calls for the same video incur ~1-5s each. Consider a small TTL cache keyed by video_id.",
+    "CORS is allow_origins=['*'] with allow_credentials=True — this is silently ignored by browsers per spec (credentials require an explicit origin). Not blocking for the current mobile-first client, but flag for future web clients."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_shrimusic_backend.py",
+    "/app/test_reports/iteration_3.json",
+    "/app/test_reports/pytest/iteration_3.xml"
+  ],
+  "success_rate": {"backend": "100% (13/13 pytest)", "frontend": "not tested (backend-only iteration)"},
+  "seed_data_creation": "Firebase test users prefixed with TEST_<uuid>@example.com created via /api/auth/register (one per run). Provider config saved for preview.listener@example.com pointing at https://piped.example (harmless placeholder). A TEST_Chill_<hex> playlist and history/liked entries were created; liked entry is deleted at the end of its flow. No production data modified.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend URL is exposed via EXPO_PUBLIC_BACKEND_URL in /app/frontend/.env; my tests also accept EXPO_BACKEND_URL and fall back to the preview URL. Firebase Web API key is AIzaSyB0UA_jmus1XNt0JhIB76--XayP32_3lIM; seeded email preview.listener@example.com / password ShriMusic@123. When registering new users through the API, the Firebase project enforces PASSWORD_POLICY requiring a non-alphanumeric char — use e.g. 'Testing@123'. yt-dlp stream extraction typically completes within 5-15s per video id; the test uses a 90s timeout to be safe.",
+  "rca_of_issue": "Only failure encountered while authoring the suite was POST /api/auth/register returning 400 for the seeded password 'Testing123'. Backend log revealed the underlying Firebase error 'PASSWORD_DOES_NOT_MEET_REQUIREMENTS: Missing password requirements: [Password must contain a non-alphanumeric character]'. Fixed the test to use 'Testing@123'. This is a test data fix, not a code defect, but the backend collapses the specific Firebase message into a generic 'Could not create account' 400 — flagged as a minor code-review item."
+}

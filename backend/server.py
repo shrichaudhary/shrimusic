@@ -1,17 +1,14 @@
-from datetime import datetime, timedelta, timezone
+from __future__ import annotations
+
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-import secrets
 from typing import Any, Dict, List, Optional
-import uuid
 
-import bcrypt
-import httpx
-import jwt
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query
-from motor.motor_asyncio import AsyncIOMotorClient
+from firebase_admin import auth as fb_auth
 from pydantic import BaseModel, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
 
@@ -19,17 +16,19 @@ from starlette.middleware.cors import CORSMiddleware
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-MONGO_URL = os.environ["MONGO_URL"]
-DB_NAME = os.environ["DB_NAME"]
-JWT_SECRET = os.environ.get("JWT_SECRET", "shrimusic-development-secret")
-JWT_ALGORITHM = "HS256"
-SESSION_DAYS = 7
+# Firebase must import AFTER env is loaded.
+from firebase_client import create_user, db, upsert_profile, verify_id_token  # noqa: E402
+from youtube_client import get_stream, home_feed, search_tracks  # noqa: E402
 
-client = AsyncIOMotorClient(MONGO_URL)
-db = client[DB_NAME]
+
+logger = logging.getLogger("shrimusic")
+logging.basicConfig(level=logging.INFO)
+
 app = FastAPI(title="ShriMusic API")
 api_router = APIRouter(prefix="/api")
-logger = logging.getLogger("shrimusic")
+
+
+# ---------- Schemas ----------
 
 
 class UserResponse(BaseModel):
@@ -39,22 +38,15 @@ class UserResponse(BaseModel):
     picture: Optional[str] = None
 
 
-class AuthResponse(BaseModel):
-    session_token: str
-    user: UserResponse
-
-
-class Credentials(BaseModel):
+class RegisterRequest(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
-
-
-class RegisterRequest(Credentials):
+    password: str = Field(min_length=6, max_length=128)
     name: str = Field(min_length=2, max_length=80)
 
 
-class SessionRequest(BaseModel):
-    session_id: str = Field(min_length=8)
+class SyncRequest(BaseModel):
+    name: Optional[str] = None
+    picture: Optional[str] = None
 
 
 class ProviderConfig(BaseModel):
@@ -67,61 +59,66 @@ class ProviderResponse(ProviderConfig):
     connected: bool
 
 
+class Track(BaseModel):
+    id: str
+    title: str
+    artist: str
+    art_url: Optional[str] = None
+    stream_url: Optional[str] = None
+    duration_seconds: Optional[int] = None
+
+
+class TrackFeed(BaseModel):
+    tracks: List[Track]
+    message: Optional[str] = None
+
+
+class LikeRequest(BaseModel):
+    track: Track
+
+
+class PlaylistCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class PlaylistAddTrack(BaseModel):
+    track: Track
+
+
+class HistoryRecord(BaseModel):
+    track: Track
+
+
+# ---------- Helpers ----------
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def user_response(doc: Dict[str, Any]) -> UserResponse:
-    return UserResponse(
-        user_id=doc["user_id"],
-        email=doc["email"],
-        name=doc.get("name") or doc["email"].split("@")[0],
-        picture=doc.get("picture"),
-    )
-
-
-async def create_session(user_id: str) -> str:
-    session_token = secrets.token_urlsafe(40)
-    created_at = now_utc()
-    await db.user_sessions.insert_one(
-        {
-            "session_token": session_token,
-            "user_id": user_id,
-            "created_at": created_at,
-            "expires_at": created_at + timedelta(days=SESSION_DAYS),
-        }
-    )
-    return session_token
 
 
 async def current_user(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authentication required")
     token = authorization.removeprefix("Bearer ").strip()
-    session = await db.user_sessions.find_one(
-        {"session_token": token},
-        {"_id": 0},
+    try:
+        decoded = verify_id_token(token)
+    except Exception as exc:  # firebase raises different subclasses; treat all as auth failure
+        logger.info("Token verification failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Session expired") from exc
+    return decoded
+
+
+def user_response(uid: str, decoded: Dict[str, Any], profile: Optional[Dict[str, Any]] = None) -> UserResponse:
+    profile = profile or {}
+    return UserResponse(
+        user_id=uid,
+        email=profile.get("email") or decoded.get("email"),
+        name=profile.get("name") or decoded.get("name") or (decoded.get("email") or "listener").split("@")[0],
+        picture=profile.get("picture") or decoded.get("picture"),
     )
-    if not session:
-        raise HTTPException(status_code=401, detail="Session expired")
-    expires_at = session["expires_at"]
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if expires_at <= now_utc():
-        raise HTTPException(status_code=401, detail="Session expired")
-    user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    return user
 
 
-async def ensure_indexes() -> None:
-    await db.users.create_index("email", unique=True)
-    await db.users.create_index("user_id", unique=True)
-    await db.user_sessions.create_index("session_token", unique=True)
-    await db.user_sessions.create_index("user_id")
-    await db.user_sessions.create_index("expires_at", expireAfterSeconds=0)
-    await db.provider_configs.create_index("user_id", unique=True)
+# ---------- Auth ----------
 
 
 @api_router.get("/health")
@@ -129,109 +126,96 @@ async def health() -> Dict[str, str]:
     return {"status": "ok", "service": "shrimusic"}
 
 
-@api_router.post("/auth/register", response_model=AuthResponse)
-async def register(payload: RegisterRequest) -> AuthResponse:
-    email = payload.email.lower()
-    existing = await db.users.find_one({"email": email}, {"_id": 0})
-    if existing:
-        raise HTTPException(status_code=409, detail="An account already exists for this email")
-    user_doc = {
-        "user_id": f"user_{uuid.uuid4().hex[:12]}",
-        "email": email,
+@api_router.post("/auth/register", response_model=UserResponse)
+async def register(payload: RegisterRequest) -> UserResponse:
+    """Create a Firebase Auth user, then materialize the profile in Firestore.
+
+    The client should immediately sign in with the same credentials to obtain
+    a Firebase ID token.
+    """
+    try:
+        record = create_user(email=payload.email, password=payload.password, display_name=payload.name.strip())
+    except fb_auth.EmailAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail="An account already exists for this email") from exc
+    except Exception as exc:
+        logger.warning("register failed: %s", exc)
+        message = str(exc)
+        detail = "Could not create account"
+        if "PASSWORD_DOES_NOT_MEET_REQUIREMENTS" in message:
+            detail = "Password needs at least one number and one symbol."
+        elif "WEAK_PASSWORD" in message:
+            detail = "Password is too weak. Use at least 6 characters."
+        elif "INVALID_EMAIL" in message:
+            detail = "That email address doesn't look right."
+        raise HTTPException(status_code=400, detail=detail) from exc
+
+    profile = {
+        "email": record.email,
         "name": payload.name.strip(),
         "picture": None,
-        "password_hash": bcrypt.hashpw(payload.password.encode(), bcrypt.gensalt()).decode(),
         "created_at": now_utc(),
     }
-    await db.users.insert_one(user_doc)
-    token = await create_session(user_doc["user_id"])
-    return AuthResponse(session_token=token, user=user_response(user_doc))
-
-
-@api_router.post("/auth/login", response_model=AuthResponse)
-async def login(payload: Credentials) -> AuthResponse:
-    user_doc = await db.users.find_one({"email": payload.email.lower()}, {"_id": 0})
-    if not user_doc or not user_doc.get("password_hash"):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    if not bcrypt.checkpw(payload.password.encode(), user_doc["password_hash"].encode()):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = await create_session(user_doc["user_id"])
-    return AuthResponse(session_token=token, user=user_response(user_doc))
-
-
-@api_router.post("/auth/session", response_model=AuthResponse)
-async def exchange_google_session(payload: SessionRequest) -> AuthResponse:
-    try:
-        async with httpx.AsyncClient(timeout=15) as http_client:
-            response = await http_client.get(
-                "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-                headers={"X-Session-ID": payload.session_id},
-            )
-    except httpx.HTTPError as exc:
-        logger.warning("Google session exchange failed: %s", exc)
-        raise HTTPException(status_code=401, detail="Google sign-in is unavailable") from exc
-    if response.status_code != 200:
-        raise HTTPException(status_code=401, detail="Google sign-in session expired")
-    data = response.json()
-    email = str(data.get("email", "")).lower()
-    if not email or not data.get("session_token"):
-        raise HTTPException(status_code=401, detail="Google profile was incomplete")
-    existing = await db.users.find_one({"email": email}, {"_id": 0})
-    if existing:
-        user_doc = existing
-        await db.users.update_one(
-            {"user_id": user_doc["user_id"]},
-            {"$set": {"name": data.get("name") or user_doc.get("name"), "picture": data.get("picture")}},
-        )
-        user_doc = {**user_doc, "name": data.get("name") or user_doc.get("name"), "picture": data.get("picture")}
-    else:
-        user_doc = {
-            "user_id": f"user_{uuid.uuid4().hex[:12]}",
-            "email": email,
-            "name": data.get("name") or email.split("@")[0],
-            "picture": data.get("picture"),
-            "created_at": now_utc(),
-        }
-        await db.users.insert_one(user_doc)
-    token = await create_session(user_doc["user_id"])
-    return AuthResponse(session_token=token, user=user_response(user_doc))
+    upsert_profile(record.uid, profile)
+    return UserResponse(user_id=record.uid, email=record.email, name=profile["name"], picture=None)
 
 
 @api_router.get("/auth/me", response_model=UserResponse)
-async def get_me(user: Dict[str, Any] = Depends(current_user)) -> UserResponse:
-    return user_response(user)
+async def get_me(decoded: Dict[str, Any] = Depends(current_user)) -> UserResponse:
+    uid = decoded["uid"]
+    snap = db().collection("users").document(uid).get()
+    profile = snap.to_dict() if snap.exists else None
+    if not profile:
+        # First login via Firebase Auth (e.g. Google) — bootstrap profile.
+        profile = {
+            "email": decoded.get("email"),
+            "name": decoded.get("name") or (decoded.get("email") or "listener").split("@")[0],
+            "picture": decoded.get("picture"),
+            "created_at": now_utc(),
+        }
+        upsert_profile(uid, profile)
+    return user_response(uid, decoded, profile)
 
 
-@api_router.post("/auth/logout")
-async def logout(authorization: Optional[str] = Header(default=None)) -> Dict[str, bool]:
-    if authorization and authorization.startswith("Bearer "):
-        await db.user_sessions.delete_one({"session_token": authorization.removeprefix("Bearer ").strip()})
-    return {"success": True}
+@api_router.post("/auth/sync", response_model=UserResponse)
+async def sync_profile(payload: SyncRequest, decoded: Dict[str, Any] = Depends(current_user)) -> UserResponse:
+    uid = decoded["uid"]
+    update: Dict[str, Any] = {"email": decoded.get("email"), "updated_at": now_utc()}
+    if payload.name:
+        update["name"] = payload.name.strip()
+    if payload.picture is not None:
+        update["picture"] = payload.picture
+    if "name" not in update:
+        update.setdefault("name", decoded.get("name") or (decoded.get("email") or "listener").split("@")[0])
+    profile = upsert_profile(uid, update)
+    return user_response(uid, decoded, profile)
+
+
+# ---------- Provider config ----------
 
 
 @api_router.get("/profile/provider", response_model=ProviderResponse)
-async def get_provider(user: Dict[str, Any] = Depends(current_user)) -> ProviderResponse:
-    config = await db.provider_configs.find_one({"user_id": user["user_id"]}, {"_id": 0})
-    if not config:
-        return ProviderResponse(connected=False)
+async def get_provider(decoded: Dict[str, Any] = Depends(current_user)) -> ProviderResponse:
+    uid = decoded["uid"]
+    snap = db().collection("users").document(uid).collection("meta").document("provider").get()
+    data = snap.to_dict() if snap.exists else {}
     return ProviderResponse(
-        endpoint=config.get("endpoint", ""),
-        api_key=config.get("api_key", ""),
-        fallback_endpoint=config.get("fallback_endpoint", ""),
-        connected=bool(config.get("endpoint")),
+        endpoint=data.get("endpoint", ""),
+        api_key=data.get("api_key", ""),
+        fallback_endpoint=data.get("fallback_endpoint", ""),
+        connected=bool(data.get("endpoint")),
     )
 
 
 @api_router.put("/profile/provider", response_model=ProviderResponse)
-async def save_provider(payload: ProviderConfig, user: Dict[str, Any] = Depends(current_user)) -> ProviderResponse:
+async def save_provider(payload: ProviderConfig, decoded: Dict[str, Any] = Depends(current_user)) -> ProviderResponse:
+    uid = decoded["uid"]
     values = {
-        "user_id": user["user_id"],
         "endpoint": payload.endpoint.strip().rstrip("/"),
         "api_key": payload.api_key.strip(),
         "fallback_endpoint": payload.fallback_endpoint.strip().rstrip("/"),
         "updated_at": now_utc(),
     }
-    await db.provider_configs.update_one({"user_id": user["user_id"]}, {"$set": values}, upsert=True)
+    db().collection("users").document(uid).collection("meta").document("provider").set(values, merge=True)
     return ProviderResponse(
         endpoint=values["endpoint"],
         api_key=values["api_key"],
@@ -240,23 +224,164 @@ async def save_provider(payload: ProviderConfig, user: Dict[str, Any] = Depends(
     )
 
 
-@api_router.get("/music/home")
-async def home(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
-    config = await db.provider_configs.find_one({"user_id": user["user_id"]}, {"_id": 0})
-    connected = bool(config and config.get("endpoint"))
-    return {
-        "connected": connected,
-        "tracks": [],
-        "message": "Your provider is ready. Search and playback will appear here when its adapter is connected." if connected else "Connect an Invidious or Piped endpoint to start discovering music.",
-    }
+# ---------- Music (YouTube) ----------
 
 
-@api_router.get("/music/search")
-async def search(q: str = Query(min_length=1, max_length=120), user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
-    config = await db.provider_configs.find_one({"user_id": user["user_id"]}, {"_id": 0})
-    if not config or not config.get("endpoint"):
-        return {"connected": False, "tracks": [], "message": "Connect a provider in Settings to search."}
-    return {"connected": True, "tracks": [], "message": f"Provider connected. Search adapter will query for {q!r}."}
+@api_router.get("/music/home", response_model=TrackFeed)
+async def home(decoded: Dict[str, Any] = Depends(current_user)) -> TrackFeed:
+    tracks = await home_feed(limit=24)
+    message = None if tracks else "YouTube Music is unreachable right now. Try again in a moment."
+    return TrackFeed(tracks=[Track(**t) for t in tracks], message=message)
+
+
+@api_router.get("/music/search", response_model=TrackFeed)
+async def search(q: str = Query(min_length=1, max_length=120), decoded: Dict[str, Any] = Depends(current_user)) -> TrackFeed:
+    tracks = await search_tracks(q, limit=25)
+    message = None if tracks else f"No results found for {q!r}."
+    return TrackFeed(tracks=[Track(**t) for t in tracks], message=message)
+
+
+@api_router.get("/music/stream/{video_id}", response_model=Track)
+async def stream(video_id: str, decoded: Dict[str, Any] = Depends(current_user)) -> Track:
+    result = await get_stream(video_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="This track can't be streamed right now")
+    return Track(**result)
+
+
+# ---------- Library: liked songs ----------
+
+
+@api_router.get("/library/liked", response_model=TrackFeed)
+async def list_liked(decoded: Dict[str, Any] = Depends(current_user)) -> TrackFeed:
+    uid = decoded["uid"]
+    docs = (
+        db()
+        .collection("users")
+        .document(uid)
+        .collection("liked_songs")
+        .order_by("liked_at", direction="DESCENDING")
+        .limit(100)
+        .stream()
+    )
+    tracks = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        tracks.append(Track(id=doc.id, title=data.get("title", ""), artist=data.get("artist", ""), art_url=data.get("art_url")))
+    return TrackFeed(tracks=tracks)
+
+
+@api_router.post("/library/liked", response_model=Track)
+async def add_liked(payload: LikeRequest, decoded: Dict[str, Any] = Depends(current_user)) -> Track:
+    uid = decoded["uid"]
+    ref = db().collection("users").document(uid).collection("liked_songs").document(payload.track.id)
+    ref.set(
+        {
+            "title": payload.track.title,
+            "artist": payload.track.artist,
+            "art_url": payload.track.art_url,
+            "liked_at": now_utc(),
+        },
+        merge=True,
+    )
+    return payload.track
+
+
+@api_router.delete("/library/liked/{track_id}")
+async def remove_liked(track_id: str, decoded: Dict[str, Any] = Depends(current_user)) -> Dict[str, bool]:
+    uid = decoded["uid"]
+    db().collection("users").document(uid).collection("liked_songs").document(track_id).delete()
+    return {"success": True}
+
+
+# ---------- Library: playlists ----------
+
+
+@api_router.get("/library/playlists")
+async def list_playlists(decoded: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    uid = decoded["uid"]
+    docs = (
+        db()
+        .collection("users")
+        .document(uid)
+        .collection("playlists")
+        .order_by("created_at", direction="DESCENDING")
+        .stream()
+    )
+    playlists = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        playlists.append({"id": doc.id, "name": data.get("name", ""), "track_count": data.get("track_count", 0)})
+    return {"playlists": playlists}
+
+
+@api_router.post("/library/playlists")
+async def create_playlist(payload: PlaylistCreate, decoded: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    uid = decoded["uid"]
+    ref = db().collection("users").document(uid).collection("playlists").document()
+    ref.set({"name": payload.name.strip(), "track_count": 0, "created_at": now_utc()})
+    return {"id": ref.id, "name": payload.name.strip(), "track_count": 0}
+
+
+@api_router.post("/library/playlists/{playlist_id}/tracks", response_model=Track)
+async def add_track_to_playlist(playlist_id: str, payload: PlaylistAddTrack, decoded: Dict[str, Any] = Depends(current_user)) -> Track:
+    uid = decoded["uid"]
+    base = db().collection("users").document(uid).collection("playlists").document(playlist_id)
+    if not base.get().exists:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    base.collection("tracks").document(payload.track.id).set(
+        {
+            "title": payload.track.title,
+            "artist": payload.track.artist,
+            "art_url": payload.track.art_url,
+            "added_at": now_utc(),
+        },
+        merge=True,
+    )
+    # naive increment
+    snap = base.get().to_dict() or {}
+    base.set({"track_count": (snap.get("track_count", 0) or 0) + 1}, merge=True)
+    return payload.track
+
+
+# ---------- Library: history ----------
+
+
+@api_router.get("/library/history", response_model=TrackFeed)
+async def list_history(decoded: Dict[str, Any] = Depends(current_user)) -> TrackFeed:
+    uid = decoded["uid"]
+    docs = (
+        db()
+        .collection("users")
+        .document(uid)
+        .collection("history")
+        .order_by("played_at", direction="DESCENDING")
+        .limit(50)
+        .stream()
+    )
+    tracks = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        tracks.append(Track(id=data.get("track_id", doc.id), title=data.get("title", ""), artist=data.get("artist", ""), art_url=data.get("art_url")))
+    return TrackFeed(tracks=tracks)
+
+
+@api_router.post("/library/history", response_model=Track)
+async def record_history(payload: HistoryRecord, decoded: Dict[str, Any] = Depends(current_user)) -> Track:
+    uid = decoded["uid"]
+    db().collection("users").document(uid).collection("history").add(
+        {
+            "track_id": payload.track.id,
+            "title": payload.track.title,
+            "artist": payload.track.artist,
+            "art_url": payload.track.art_url,
+            "played_at": now_utc(),
+        }
+    )
+    return payload.track
+
+
+# ---------- Wire up ----------
 
 
 app.include_router(api_router)
@@ -270,10 +395,15 @@ app.add_middleware(
 
 
 @app.on_event("startup")
-async def startup_db_client() -> None:
-    await ensure_indexes()
-
-
-@app.on_event("shutdown")
-async def shutdown_db_client() -> None:
-    client.close()
+async def startup_event() -> None:
+    # Seed a test account so testing agents can log in without external steps.
+    email = "preview.listener@example.com"
+    try:
+        try:
+            user = fb_auth.get_user_by_email(email)
+        except fb_auth.UserNotFoundError:
+            user = create_user(email=email, password="ShriMusic@123", display_name="Preview Listener")
+            logger.info("Seeded test user: %s (uid=%s)", email, user.uid)
+        upsert_profile(user.uid, {"email": email, "name": "Preview Listener", "picture": None})
+    except Exception as exc:  # non-fatal
+        logger.warning("Test user seeding skipped: %s", exc)
