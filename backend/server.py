@@ -461,8 +461,15 @@ async def record_history(payload: HistoryRecord, decoded: Dict[str, Any] = Depen
 app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],
+    # Bearer-header auth only (no cookies), so explicit origin allowlist is safest.
+    allow_origins=[
+        "https://music-streaming-dev-1.preview.emergentagent.com",
+        "http://localhost:3000",
+        "http://localhost:8081",
+        "exp://*",
+        "https://*.emergent.host",
+        "https://*.emergentagent.com",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -470,13 +477,26 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    # Seed a test account so testing agents can log in without external steps.
+    # Seed a test account ONLY when the app is explicitly running in the dev/preview
+    # environment. EMERGENT_ENV must equal "preview" for seeding — production (unset
+    # or any other value) skips it entirely.
+    if os.environ.get("EMERGENT_ENV") != "preview":
+        logger.info("Not in preview mode — skipping test-user seeding.")
+        return
+
+    # Never hard-code the test password in source. Read it from an env var so
+    # we can rotate it without a code change and keep it out of git history.
+    test_password = os.environ.get("TEST_USER_PASSWORD")
+    if not test_password:
+        logger.info("TEST_USER_PASSWORD not set — skipping test-user seeding.")
+        return
+
     email = "preview.listener@example.com"
     try:
         try:
             user = fb_auth.get_user_by_email(email)
         except fb_auth.UserNotFoundError:
-            user = create_user(email=email, password="ShriMusic@123", display_name="Preview Listener")
+            user = create_user(email=email, password=test_password, display_name="Preview Listener")
             logger.info("Seeded test user: %s (uid=%s)", email, user.uid)
         upsert_profile(user.uid, {"email": email, "name": "Preview Listener", "picture": None})
     except Exception as exc:  # non-fatal

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Dict, Optional
@@ -14,10 +15,20 @@ from google.cloud.firestore import Client
 
 logger = logging.getLogger("shrimusic.firebase")
 
-_CRED_PATH = os.environ.get("FIREBASE_CREDENTIALS_PATH", "/app/backend/firebase-admin.json")
+_CRED_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+if not _CRED_JSON:
+    # Fallback to file-based key only when explicitly configured (e.g. local dev).
+    _path = os.environ.get("FIREBASE_CREDENTIALS_PATH")
+    if not _path:
+        raise RuntimeError(
+            "FIREBASE_SERVICE_ACCOUNT_JSON environment variable must be set to the full "
+            "service-account JSON string. Do not commit firebase-admin.json to git."
+        )
+    with open(_path, "r", encoding="utf-8") as fh:
+        _CRED_JSON = fh.read()
 
 if not firebase_admin._apps:
-    cred = credentials.Certificate(_CRED_PATH)
+    cred = credentials.Certificate(json.loads(_CRED_JSON))
     firebase_admin.initialize_app(cred, {"projectId": os.environ.get("FIREBASE_PROJECT_ID", "shrimusic")})
     logger.info("Firebase Admin SDK initialized for project: %s", os.environ.get("FIREBASE_PROJECT_ID"))
 

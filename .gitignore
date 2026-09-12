@@ -80,3 +80,6 @@ memory/test_credentials.md
 
 # Mobile development
 android-sdk/
+backend/firebase-admin.json
+backend/.env
+frontend/.env
