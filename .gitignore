@@ -83,3 +83,9 @@ android-sdk/
 backend/firebase-admin.json
 backend/.env
 frontend/.env
+.env
+.env.*
+*.env
+credentials.json
+*.key
+.credentials
