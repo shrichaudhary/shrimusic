@@ -18,6 +18,7 @@ load_dotenv(ROOT_DIR / ".env")
 
 # Firebase must import AFTER env is loaded.
 from firebase_client import create_user, db, upsert_profile, verify_id_token  # noqa: E402
+from lyrics_client import get_lyrics  # noqa: E402
 from youtube_client import get_stream, home_feed, search_tracks  # noqa: E402
 
 
@@ -249,6 +250,19 @@ async def stream(video_id: str, decoded: Dict[str, Any] = Depends(current_user))
     return Track(**result)
 
 
+@api_router.get("/music/lyrics/{video_id}")
+async def lyrics(
+    video_id: str,
+    title: str = Query(default="", max_length=200),
+    artist: str = Query(default="", max_length=200),
+    duration: Optional[int] = Query(default=None, ge=1, le=36000),
+    decoded: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    if not title and not artist:
+        raise HTTPException(status_code=400, detail="Title or artist is required")
+    return await get_lyrics(video_id, title, artist, duration)
+
+
 # ---------- Library: liked songs ----------
 
 
@@ -335,6 +349,7 @@ async def add_track_to_playlist(playlist_id: str, payload: PlaylistAddTrack, dec
             "artist": payload.track.artist,
             "art_url": payload.track.art_url,
             "added_at": now_utc(),
+            "order": now_utc().timestamp(),
         },
         merge=True,
     )
@@ -342,6 +357,65 @@ async def add_track_to_playlist(playlist_id: str, payload: PlaylistAddTrack, dec
     snap = base.get().to_dict() or {}
     base.set({"track_count": (snap.get("track_count", 0) or 0) + 1}, merge=True)
     return payload.track
+
+
+@api_router.get("/library/playlists/{playlist_id}/tracks", response_model=TrackFeed)
+async def list_playlist_tracks(playlist_id: str, decoded: Dict[str, Any] = Depends(current_user)) -> TrackFeed:
+    uid = decoded["uid"]
+    base = db().collection("users").document(uid).collection("playlists").document(playlist_id)
+    if not base.get().exists:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    docs = list(base.collection("tracks").order_by("order").stream())
+    tracks = [
+        Track(
+            id=doc.id,
+            title=(doc.to_dict() or {}).get("title", ""),
+            artist=(doc.to_dict() or {}).get("artist", ""),
+            art_url=(doc.to_dict() or {}).get("art_url"),
+        )
+        for doc in docs
+    ]
+    return TrackFeed(tracks=tracks)
+
+
+class PlaylistReorder(BaseModel):
+    track_ids: List[str]
+
+
+@api_router.post("/library/playlists/{playlist_id}/reorder")
+async def reorder_playlist(playlist_id: str, payload: PlaylistReorder, decoded: Dict[str, Any] = Depends(current_user)) -> Dict[str, bool]:
+    uid = decoded["uid"]
+    base = db().collection("users").document(uid).collection("playlists").document(playlist_id)
+    if not base.get().exists:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    for idx, track_id in enumerate(payload.track_ids):
+        base.collection("tracks").document(track_id).set({"order": float(idx)}, merge=True)
+    return {"success": True}
+
+
+@api_router.delete("/library/playlists/{playlist_id}/tracks/{track_id}")
+async def remove_from_playlist(playlist_id: str, track_id: str, decoded: Dict[str, Any] = Depends(current_user)) -> Dict[str, bool]:
+    uid = decoded["uid"]
+    base = db().collection("users").document(uid).collection("playlists").document(playlist_id)
+    if not base.get().exists:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    base.collection("tracks").document(track_id).delete()
+    snap = base.get().to_dict() or {}
+    base.set({"track_count": max(0, (snap.get("track_count", 0) or 0) - 1)}, merge=True)
+    return {"success": True}
+
+
+@api_router.delete("/library/playlists/{playlist_id}")
+async def delete_playlist(playlist_id: str, decoded: Dict[str, Any] = Depends(current_user)) -> Dict[str, bool]:
+    uid = decoded["uid"]
+    base = db().collection("users").document(uid).collection("playlists").document(playlist_id)
+    if not base.get().exists:
+        return {"success": True}
+    # Best-effort delete all tracks first
+    for doc in base.collection("tracks").stream():
+        doc.reference.delete()
+    base.delete()
+    return {"success": True}
 
 
 # ---------- Library: history ----------

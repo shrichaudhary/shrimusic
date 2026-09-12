@@ -1,20 +1,25 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { setAudioModeAsync, useAudioPlayer, useAudioPlayerStatus } from "expo-audio";
+import { Image } from "expo-image";
 import { LinearGradient } from "expo-linear-gradient";
-import { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, FlatList, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { apiRequest } from "@/src/api";
 import { useAuth } from "@/src/auth";
+import { AddToPlaylistSheet } from "@/src/components/add-to-playlist-sheet";
 import { AlbumArt } from "@/src/components/album-art";
+import { PlayerSheet, PlayerTrack } from "@/src/components/player-sheet";
+import { PlaylistDetail } from "@/src/components/playlist-detail";
 import { makeStyles, setColorScheme, useTheme } from "@/src/theme";
-import { storage } from "@/src/utils/storage";
+import { DownloadedTrack, isDownloaded, listDownloads } from "@/src/utils/downloads";
 
 type Tab = "Home" | "Search" | "Library" | "Settings";
-type Track = { id: string; title: string; artist: string; stream_url?: string | null; art_url?: string | null };
+type Track = { id: string; title: string; artist: string; stream_url?: string | null; art_url?: string | null; duration_seconds?: number | null };
 type TrackFeed = { tracks: Track[]; message?: string | null };
 type Provider = { endpoint: string; api_key: string; fallback_endpoint: string; connected: boolean };
+type Playlist = { id: string; name: string; track_count?: number };
 
 const navItems: { tab: Tab; icon: keyof typeof MaterialCommunityIcons.glyphMap }[] = [
   { tab: "Home", icon: "home-variant" },
@@ -23,23 +28,27 @@ const navItems: { tab: Tab; icon: keyof typeof MaterialCommunityIcons.glyphMap }
   { tab: "Settings", icon: "cog-outline" },
 ];
 
+const LOGO = require("../../assets/images/logo.webp");
+
 export function MainApp() {
   const insets = useSafeAreaInsets();
   const { colors, scheme } = useTheme();
   const { user, signOut } = useAuth();
   const styles = useStyles();
   const [tab, setTab] = useState<Tab>("Home");
-  const [track, setTrack] = useState<Track | null>(null);
+  const [track, setTrack] = useState<PlayerTrack | null>(null);
+  const [queue, setQueue] = useState<Track[]>([]);
+  const [queueIndex, setQueueIndex] = useState<number>(-1);
   const [playerOpen, setPlayerOpen] = useState(false);
   const [resolving, setResolving] = useState<string | null>(null);
   const [likedIds, setLikedIds] = useState<Set<string>>(new Set());
   const [provider, setProvider] = useState<Provider>({ endpoint: "", api_key: "", fallback_endpoint: "", connected: false });
   const [providerSaving, setProviderSaving] = useState(false);
   const [providerMessage, setProviderMessage] = useState<string | null>(null);
-  const [playlists, setPlaylists] = useState<string[]>([]);
-  const [playlistName, setPlaylistName] = useState("");
-  const [showPlaylistInput, setShowPlaylistInput] = useState(false);
   const [sleepRemainingSeconds, setSleepRemainingSeconds] = useState(0);
+  const [addToPlaylistTrack, setAddToPlaylistTrack] = useState<Track | null>(null);
+  const [openedPlaylist, setOpenedPlaylist] = useState<Playlist | null>(null);
+  const [downloads, setDownloads] = useState<DownloadedTrack[]>([]);
 
   const player = useAudioPlayer(track?.stream_url ?? undefined);
   const playerStatus = useAudioPlayerStatus(player);
@@ -62,37 +71,55 @@ export function MainApp() {
     return () => clearInterval(timer);
   }, [player, sleepRemainingSeconds]);
 
+  const refreshLibrary = useCallback(async () => {
+    try {
+      const [liked, dls] = await Promise.all([apiRequest<TrackFeed>("/library/liked").catch(() => ({ tracks: [] })), listDownloads()]);
+      setLikedIds(new Set(liked.tracks.map((t) => t.id)));
+      setDownloads(dls);
+    } catch {
+      // silent
+    }
+  }, []);
+
   useEffect(() => {
     let active = true;
-    const load = async () => {
+    (async () => {
       try {
-        const [savedProvider, savedPlaylists, likedFeed] = await Promise.all([
-          apiRequest<Provider>("/profile/provider").catch(() => ({ endpoint: "", api_key: "", fallback_endpoint: "", connected: false })),
-          storage.getItem<string>("shrimusic_playlists", ""),
-          apiRequest<TrackFeed>("/library/liked").catch(() => ({ tracks: [] })),
-        ]);
-        if (!active) return;
-        setProvider(savedProvider);
-        setPlaylists(savedPlaylists ? savedPlaylists.split("\n").filter(Boolean) : []);
-        setLikedIds(new Set(likedFeed.tracks.map((t) => t.id)));
+        const savedProvider = await apiRequest<Provider>("/profile/provider").catch(() => ({ endpoint: "", api_key: "", fallback_endpoint: "", connected: false }));
+        if (active) setProvider(savedProvider);
+        if (active) await refreshLibrary();
       } catch {
-        // non-fatal
+        // silent
       }
-    };
-    void load();
+    })();
     return () => {
       active = false;
     };
-  }, []);
+  }, [refreshLibrary]);
 
   const playTrack = useCallback(
-    async (item: Track) => {
+    async (item: Track, contextQueue?: Track[]) => {
       setResolving(item.id);
       try {
-        const resolved = await apiRequest<Track>(`/music/stream/${encodeURIComponent(item.id)}`);
-        setTrack({ ...item, ...resolved });
+        // Serve from local download if available
+        const local = await isDownloaded(item.id);
+        let resolved: Track;
+        if (local) {
+          resolved = { id: local.id, title: local.title, artist: local.artist, art_url: local.art_url, stream_url: local.local_uri };
+        } else {
+          resolved = await apiRequest<Track>(`/music/stream/${encodeURIComponent(item.id)}`);
+        }
+        const nextTrack = { ...item, ...resolved };
+        setTrack(nextTrack);
+        if (contextQueue && contextQueue.length) {
+          setQueue(contextQueue);
+          setQueueIndex(contextQueue.findIndex((t) => t.id === item.id));
+        }
         // Record history (best-effort)
-        void apiRequest("/library/history", { method: "POST", body: JSON.stringify({ track: { id: resolved.id, title: resolved.title, artist: resolved.artist, art_url: resolved.art_url } }) }).catch(() => undefined);
+        void apiRequest("/library/history", {
+          method: "POST",
+          body: JSON.stringify({ track: { id: nextTrack.id, title: nextTrack.title, artist: nextTrack.artist, art_url: nextTrack.art_url } }),
+        }).catch(() => undefined);
       } catch (reason) {
         setProviderMessage(reason instanceof Error ? reason.message : "Could not load track.");
       } finally {
@@ -104,16 +131,27 @@ export function MainApp() {
 
   useEffect(() => {
     if (track?.stream_url) {
-      // Auto-play once a new stream URL is loaded.
       try {
         player.setActiveForLockScreen(true, { title: track.title, artist: track.artist });
       } catch {
-        // some platforms may not support metadata
+        // ignore
       }
       player.play();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [track?.stream_url]);
+
+  const playNext = useCallback(() => {
+    if (queueIndex < 0 || queue.length === 0) return;
+    const next = queueIndex + 1 < queue.length ? queueIndex + 1 : 0;
+    void playTrack(queue[next], queue);
+  }, [queueIndex, queue, playTrack]);
+
+  const playPrev = useCallback(() => {
+    if (queueIndex < 0 || queue.length === 0) return;
+    const prev = queueIndex - 1 >= 0 ? queueIndex - 1 : queue.length - 1;
+    void playTrack(queue[prev], queue);
+  }, [queueIndex, queue, playTrack]);
 
   const toggleLike = useCallback(
     async (item: Track) => {
@@ -131,7 +169,6 @@ export function MainApp() {
           await apiRequest("/library/liked", { method: "POST", body: JSON.stringify({ track: { id: item.id, title: item.title, artist: item.artist, art_url: item.art_url } }) });
         }
       } catch {
-        // revert on failure
         setLikedIds((prev) => {
           const next = new Set(prev);
           if (isLiked) next.add(item.id);
@@ -160,16 +197,6 @@ export function MainApp() {
     }
   };
 
-  const addPlaylist = async () => {
-    const next = playlistName.trim();
-    if (!next || playlists.includes(next)) return;
-    const updated = [...playlists, next];
-    setPlaylists(updated);
-    setPlaylistName("");
-    setShowPlaylistInput(false);
-    await storage.setItem("shrimusic_playlists", updated.join("\n"));
-  };
-
   const togglePlayback = () => {
     if (!track?.stream_url) return;
     if (playerStatus.playing) player.pause();
@@ -177,13 +204,61 @@ export function MainApp() {
   };
   const setSleepMinutes = (minutes: number) => setSleepRemainingSeconds(minutes * 60);
 
+  // If a playlist is opened, render its detail full-screen inside the main shell
+  if (openedPlaylist) {
+    return (
+      <View style={styles.root}>
+        <PlaylistDetail
+          playlistId={openedPlaylist.id}
+          playlistName={openedPlaylist.name}
+          onBack={() => setOpenedPlaylist(null)}
+          onPlay={(item) => void playTrack(item)}
+          resolvingId={resolving}
+        />
+        <MiniPlayer track={track} playing={playerStatus.playing} onOpen={() => setPlayerOpen(true)} onToggle={togglePlayback} bottom={insets.bottom + 12} />
+        {playerOpen ? (
+          <PlayerSheet
+            track={track}
+            playing={playerStatus.playing}
+            currentTime={playerStatus.currentTime ?? 0}
+            duration={playerStatus.duration || track?.duration_seconds || 0}
+            liked={track ? likedIds.has(track.id) : false}
+            hasQueue={queue.length > 1}
+            onToggle={togglePlayback}
+            onSeek={(sec) => {
+              try {
+                player.seekTo(sec);
+              } catch {
+                // ignore
+              }
+            }}
+            onClose={() => setPlayerOpen(false)}
+            onLike={() => track && void toggleLike(track)}
+            onNext={playNext}
+            onPrev={playPrev}
+            onAddToPlaylist={() => track && setAddToPlaylistTrack(track)}
+          />
+        ) : null}
+        {addToPlaylistTrack ? (
+          <AddToPlaylistSheet track={addToPlaylistTrack} onClose={() => setAddToPlaylistTrack(null)} />
+        ) : null}
+      </View>
+    );
+  }
+
   const content =
     tab === "Home" ? (
-      <HomeScreen userName={user?.name ?? "Listener"} onPlay={playTrack} resolvingId={resolving} likedIds={likedIds} onLike={toggleLike} />
+      <HomeScreen userName={user?.name ?? "Listener"} onPlay={playTrack} resolvingId={resolving} likedIds={likedIds} onLike={toggleLike} onAdd={setAddToPlaylistTrack} />
     ) : tab === "Search" ? (
-      <SearchScreen onPlay={playTrack} resolvingId={resolving} likedIds={likedIds} onLike={toggleLike} />
+      <SearchScreen onPlay={playTrack} resolvingId={resolving} likedIds={likedIds} onLike={toggleLike} onAdd={setAddToPlaylistTrack} />
     ) : tab === "Library" ? (
-      <LibraryScreen playlists={playlists} showInput={showPlaylistInput} name={playlistName} onName={setPlaylistName} onAdd={addPlaylist} onShowInput={() => setShowPlaylistInput(true)} onPlay={playTrack} resolvingId={resolving} />
+      <LibraryScreen
+        onPlay={playTrack}
+        resolvingId={resolving}
+        onOpenPlaylist={(pl) => setOpenedPlaylist(pl)}
+        downloads={downloads}
+        onDownloadsChanged={refreshLibrary}
+      />
     ) : (
       <SettingsScreen provider={provider} saving={providerSaving} message={providerMessage} setProvider={setProvider} saveProvider={saveProvider} scheme={scheme} onTheme={() => setColorScheme(scheme === "dark" ? "light" : "dark")} sleepRemainingSeconds={sleepRemainingSeconds} onSetSleepTimer={setSleepMinutes} onSignOut={() => void signOut()} />
     );
@@ -193,18 +268,7 @@ export function MainApp() {
       <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 12, paddingBottom: insets.bottom + 156 }]} showsVerticalScrollIndicator={false}>
         {content}
       </ScrollView>
-      <View pointerEvents={tab === "Settings" ? "none" : "auto"} style={[styles.miniPlayer, { bottom: insets.bottom + 70 }]}>
-        <Pressable testID="mini-player" onPress={() => setPlayerOpen(true)} accessibilityRole="button" style={({ pressed }) => [styles.miniPressable, pressed && styles.pressed]}>
-          <AlbumArt size={42} icon={track ? "music-note" : "waveform"} url={track?.art_url} />
-          <View style={styles.miniCopy}>
-            <Text numberOfLines={1} style={styles.miniTitle}>{track?.title ?? "No track loaded"}</Text>
-            <Text numberOfLines={1} style={styles.miniSubtitle}>{track?.artist ?? "Pick something to play"}</Text>
-          </View>
-        </Pressable>
-        <Pressable testID="mini-player-toggle" onPress={togglePlayback} accessibilityRole="button" hitSlop={8} style={styles.miniAction}>
-          <MaterialCommunityIcons name={playerStatus.playing ? "pause" : "play"} size={22} color={colors.onSurface} />
-        </Pressable>
-      </View>
+      <MiniPlayer track={track} playing={playerStatus.playing} onOpen={() => setPlayerOpen(true)} onToggle={togglePlayback} bottom={insets.bottom + 70} disabled={tab === "Settings"} />
       <View style={[styles.tabBar, { paddingBottom: Math.max(insets.bottom, 10), backgroundColor: colors.surfaceSecondary, borderTopColor: colors.border }]}>
         {navItems.map((item) => {
           const active = item.tab === tab;
@@ -220,23 +284,59 @@ export function MainApp() {
         <PlayerSheet
           track={track}
           playing={playerStatus.playing}
-          onToggle={togglePlayback}
-          onClose={() => setPlayerOpen(false)}
+          currentTime={playerStatus.currentTime ?? 0}
+          duration={playerStatus.duration || track?.duration_seconds || 0}
           liked={track ? likedIds.has(track.id) : false}
+          hasQueue={queue.length > 1}
+          onToggle={togglePlayback}
+          onSeek={(sec) => {
+            try {
+              player.seekTo(sec);
+            } catch {
+              // ignore
+            }
+          }}
+          onClose={() => setPlayerOpen(false)}
           onLike={() => track && void toggleLike(track)}
+          onNext={playNext}
+          onPrev={playPrev}
+          onAddToPlaylist={() => track && setAddToPlaylistTrack(track)}
         />
+      ) : null}
+      {addToPlaylistTrack ? (
+        <AddToPlaylistSheet track={addToPlaylistTrack} onClose={() => setAddToPlaylistTrack(null)} />
       ) : null}
     </View>
   );
 }
 
-function TrackRow({ item, onPlay, resolvingId, liked, onLike }: { item: Track; onPlay: (t: Track) => void; resolvingId: string | null; liked: boolean; onLike?: (t: Track) => void }) {
+function MiniPlayer({ track, playing, onOpen, onToggle, bottom, disabled }: { track: PlayerTrack | null; playing: boolean; onOpen: () => void; onToggle: () => void; bottom: number; disabled?: boolean }) {
+  const { colors } = useTheme();
+  const styles = useStyles();
+  return (
+    <View pointerEvents={disabled ? "none" : "auto"} style={[styles.miniPlayer, { bottom }]}>
+      <Pressable testID="mini-player" onPress={onOpen} accessibilityRole="button" style={({ pressed }) => [styles.miniPressable, pressed && styles.pressed]}>
+        <AlbumArt size={42} icon={track ? "music-note" : "waveform"} url={track?.art_url} />
+        <View style={styles.miniCopy}>
+          <Text numberOfLines={1} style={styles.miniTitle}>{track?.title ?? "No track loaded"}</Text>
+          <Text numberOfLines={1} style={styles.miniSubtitle}>{track?.artist ?? "Pick something to play"}</Text>
+        </View>
+      </Pressable>
+      <Pressable testID="mini-player-toggle" onPress={onToggle} accessibilityRole="button" hitSlop={8} style={styles.miniAction}>
+        <MaterialCommunityIcons name={playing ? "pause" : "play"} size={22} color={colors.onSurface} />
+      </Pressable>
+    </View>
+  );
+}
+
+type TrackRowProps = { item: Track; onPlay: (t: Track) => void; resolvingId: string | null; liked: boolean; onLike?: (t: Track) => void; onAdd?: (t: Track) => void };
+function TrackRow({ item, onPlay, resolvingId, liked, onLike, onAdd }: TrackRowProps) {
   const { colors } = useTheme();
   const styles = useStyles();
   const busy = resolvingId === item.id;
   return (
     <View style={styles.trackRow}>
-      <Pressable testID={`track-play-${item.id}`} onPress={() => onPlay(item)} disabled={busy} accessibilityRole="button" style={({ pressed }) => [styles.trackPressable, pressed && styles.pressed]}>
+      <Pressable testID={`track-play-${item.id}`} onPress={() => onPlay(item)} onLongPress={() => onAdd?.(item)} disabled={busy} accessibilityRole="button" style={({ pressed }) => [styles.trackPressable, pressed && styles.pressed]}>
         <AlbumArt size={52} icon="music-note" url={item.art_url} />
         <View style={styles.trackCopy}>
           <Text numberOfLines={1} style={styles.trackTitle}>{item.title || "Untitled"}</Text>
@@ -244,8 +344,13 @@ function TrackRow({ item, onPlay, resolvingId, liked, onLike }: { item: Track; o
         </View>
         {busy ? <ActivityIndicator color={colors.brandPrimary} /> : <MaterialCommunityIcons name="play-circle" size={26} color={colors.brandPrimary} />}
       </Pressable>
+      {onAdd ? (
+        <Pressable testID={`track-add-${item.id}`} onPress={() => onAdd(item)} hitSlop={6} style={styles.trackAction}>
+          <MaterialCommunityIcons name="playlist-plus" size={20} color={colors.muted} />
+        </Pressable>
+      ) : null}
       {onLike ? (
-        <Pressable testID={`track-like-${item.id}`} onPress={() => onLike(item)} hitSlop={8} accessibilityRole="button" style={styles.trackLike}>
+        <Pressable testID={`track-like-${item.id}`} onPress={() => onLike(item)} hitSlop={6} accessibilityRole="button" style={styles.trackAction}>
           <MaterialCommunityIcons name={liked ? "heart" : "heart-outline"} size={22} color={liked ? colors.brandPrimary : colors.muted} />
         </Pressable>
       ) : null}
@@ -253,13 +358,12 @@ function TrackRow({ item, onPlay, resolvingId, liked, onLike }: { item: Track; o
   );
 }
 
-function HomeScreen({ userName, onPlay, resolvingId, likedIds, onLike }: { userName: string; onPlay: (t: Track) => void; resolvingId: string | null; likedIds: Set<string>; onLike: (t: Track) => void }) {
+function HomeScreen({ userName, onPlay, resolvingId, likedIds, onLike, onAdd }: { userName: string; onPlay: (t: Track, ctx?: Track[]) => void; resolvingId: string | null; likedIds: Set<string>; onLike: (t: Track) => void; onAdd: (t: Track) => void }) {
   const { colors } = useTheme();
   const styles = useStyles();
   const [feed, setFeed] = useState<Track[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-
   useEffect(() => {
     let active = true;
     (async () => {
@@ -278,54 +382,51 @@ function HomeScreen({ userName, onPlay, resolvingId, likedIds, onLike }: { userN
       active = false;
     };
   }, []);
-
   return (
     <View style={styles.section}>
       <View style={styles.topline}>
-        <View>
-          <Text style={styles.kicker}>GOOD EVENING</Text>
-          <Text style={styles.heading}>{userName.split(" ")[0]}, ready to listen?</Text>
+        <View style={styles.brandLine}>
+          <Image source={LOGO} style={styles.brandLogo} contentFit="contain" transition={150} />
         </View>
         <View style={[styles.avatar, { backgroundColor: colors.brandPrimary }]}>
           <Text style={[styles.avatarText, { color: colors.onBrandPrimary }]}>{userName.slice(0, 1).toUpperCase()}</Text>
         </View>
       </View>
+      <View>
+        <Text style={styles.kicker}>GOOD EVENING</Text>
+        <Text style={styles.heading}>{userName.split(" ")[0]}, ready to listen?</Text>
+      </View>
       <LinearGradient colors={[colors.brandSecondary, colors.brandPrimary]} style={styles.hero}>
-        <View style={styles.heroGlow}>
-          <MaterialCommunityIcons name="waveform" size={38} color={colors.onBrandPrimary} />
-        </View>
+        <View style={styles.heroGlow}><MaterialCommunityIcons name="waveform" size={38} color={colors.onBrandPrimary} /></View>
         <Text style={[styles.heroEyebrow, { color: colors.onBrandPrimary }]}>SHRIMUSIC</Text>
-        <Text style={[styles.heroTitle, { color: colors.onBrandPrimary }]}>Your feed is live, powered by YouTube Music.</Text>
-        <Text style={[styles.heroText, { color: colors.onBrandPrimary }]}>Trending tracks, quick picks, and a search that reaches millions of songs.</Text>
+        <Text style={[styles.heroTitle, { color: colors.onBrandPrimary }]}>Live lyrics + downloads + queue — all in one shelf.</Text>
       </LinearGradient>
       <Text style={styles.sectionTitle}>Trending now</Text>
       {loading ? (
         <ActivityIndicator color={colors.brandPrimary} style={styles.loader} />
       ) : feed.length ? (
         <View style={styles.trackList}>
-          {feed.slice(0, 12).map((item) => (
-            <TrackRow key={item.id} item={item} onPlay={onPlay} resolvingId={resolvingId} liked={likedIds.has(item.id)} onLike={onLike} />
+          {feed.slice(0, 15).map((item) => (
+            <TrackRow key={item.id} item={item} onPlay={(t) => onPlay(t, feed)} resolvingId={resolvingId} liked={likedIds.has(item.id)} onLike={onLike} onAdd={onAdd} />
           ))}
         </View>
       ) : (
         <View style={[styles.emptyCard, { borderColor: colors.border, backgroundColor: colors.surfaceSecondary }]}>
           <MaterialCommunityIcons name="radio-tower" size={30} color={colors.brandPrimary} />
-          <Text style={styles.emptyTitle}>Feed offline</Text>
-          <Text style={styles.emptyText}>{message ?? "Could not reach YouTube Music. Try again in a moment."}</Text>
+          <Text style={styles.emptyText}>{message ?? "Could not reach YouTube Music."}</Text>
         </View>
       )}
     </View>
   );
 }
 
-function SearchScreen({ onPlay, resolvingId, likedIds, onLike }: { onPlay: (t: Track) => void; resolvingId: string | null; likedIds: Set<string>; onLike: (t: Track) => void }) {
+function SearchScreen({ onPlay, resolvingId, likedIds, onLike, onAdd }: { onPlay: (t: Track, ctx?: Track[]) => void; resolvingId: string | null; likedIds: Set<string>; onLike: (t: Track) => void; onAdd: (t: Track) => void }) {
   const { colors } = useTheme();
   const styles = useStyles();
   const [query, setQuery] = useState("");
   const [tracks, setTracks] = useState<Track[]>([]);
   const [message, setMessage] = useState<string>("Search songs, artists, albums, and more.");
   const [busy, setBusy] = useState(false);
-
   const search = async () => {
     if (!query.trim()) return;
     setBusy(true);
@@ -341,7 +442,6 @@ function SearchScreen({ onPlay, resolvingId, likedIds, onLike }: { onPlay: (t: T
       setBusy(false);
     }
   };
-
   return (
     <View style={styles.section}>
       <Text style={styles.kicker}>DISCOVER</Text>
@@ -349,24 +449,19 @@ function SearchScreen({ onPlay, resolvingId, likedIds, onLike }: { onPlay: (t: T
       <View style={[styles.searchBox, { backgroundColor: colors.surfaceSecondary, borderColor: colors.border }]}>
         <MaterialCommunityIcons name="magnify" size={22} color={colors.muted} />
         <TextInput testID="search-input" value={query} onChangeText={setQuery} onSubmitEditing={() => void search()} returnKeyType="search" placeholder="What do you want to hear?" placeholderTextColor={colors.muted} style={styles.searchInput} />
-        {query ? (
-          <Pressable testID="search-clear" onPress={() => { setQuery(""); setTracks([]); setMessage("Search songs, artists, albums, and more."); }} hitSlop={6}>
-            <MaterialCommunityIcons name="close-circle" size={18} color={colors.muted} />
-          </Pressable>
-        ) : null}
+        {query ? <Pressable testID="search-clear" onPress={() => { setQuery(""); setTracks([]); setMessage("Search songs, artists, albums, and more."); }} hitSlop={6}><MaterialCommunityIcons name="close-circle" size={18} color={colors.muted} /></Pressable> : null}
       </View>
       {busy ? (
         <ActivityIndicator color={colors.brandPrimary} style={styles.loader} />
       ) : tracks.length ? (
         <View style={styles.trackList}>
           {tracks.map((item) => (
-            <TrackRow key={item.id} item={item} onPlay={onPlay} resolvingId={resolvingId} liked={likedIds.has(item.id)} onLike={onLike} />
+            <TrackRow key={item.id} item={item} onPlay={(t) => onPlay(t, tracks)} resolvingId={resolvingId} liked={likedIds.has(item.id)} onLike={onLike} onAdd={onAdd} />
           ))}
         </View>
       ) : (
         <View style={[styles.emptyCard, { borderColor: colors.border, backgroundColor: colors.surfaceSecondary }]}>
           <MaterialCommunityIcons name="magnify-expand" size={30} color={colors.brandPrimary} />
-          <Text style={styles.emptyTitle}>Ready to search</Text>
           <Text style={styles.emptyText}>{message}</Text>
         </View>
       )}
@@ -374,32 +469,49 @@ function SearchScreen({ onPlay, resolvingId, likedIds, onLike }: { onPlay: (t: T
   );
 }
 
-function LibraryScreen({ playlists, showInput, name, onName, onAdd, onShowInput, onPlay, resolvingId }: { playlists: string[]; showInput: boolean; name: string; onName: (value: string) => void; onAdd: () => void; onShowInput: () => void; onPlay: (t: Track) => void; resolvingId: string | null }) {
+function LibraryScreen({ onPlay, resolvingId, onOpenPlaylist, downloads, onDownloadsChanged }: { onPlay: (t: Track) => void; resolvingId: string | null; onOpenPlaylist: (pl: Playlist) => void; downloads: DownloadedTrack[]; onDownloadsChanged: () => Promise<void> }) {
   const { colors } = useTheme();
   const styles = useStyles();
   const [liked, setLiked] = useState<Track[]>([]);
   const [history, setHistory] = useState<Track[]>([]);
+  const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [showInput, setShowInput] = useState(false);
+
+  const reload = useCallback(async () => {
+    try {
+      const [likedFeed, historyFeed, playlistData] = await Promise.all([
+        apiRequest<TrackFeed>("/library/liked").catch(() => ({ tracks: [] })),
+        apiRequest<TrackFeed>("/library/history").catch(() => ({ tracks: [] })),
+        apiRequest<{ playlists: Playlist[] }>("/library/playlists").catch(() => ({ playlists: [] })),
+      ]);
+      setLiked(likedFeed.tracks);
+      setHistory(historyFeed.tracks);
+      setPlaylists(playlistData.playlists);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    let active = true;
-    (async () => {
-      try {
-        const [likedFeed, historyFeed] = await Promise.all([
-          apiRequest<TrackFeed>("/library/liked").catch(() => ({ tracks: [] })),
-          apiRequest<TrackFeed>("/library/history").catch(() => ({ tracks: [] })),
-        ]);
-        if (!active) return;
-        setLiked(likedFeed.tracks);
-        setHistory(historyFeed.tracks);
-      } finally {
-        if (active) setLoading(false);
-      }
-    })();
-    return () => {
-      active = false;
-    };
-  }, []);
+    void reload();
+  }, [reload]);
+
+  const createPlaylist = async () => {
+    const name = newName.trim();
+    if (!name) return;
+    setCreating(true);
+    try {
+      const created = await apiRequest<Playlist>("/library/playlists", { method: "POST", body: JSON.stringify({ name }) });
+      setPlaylists((prev) => [created, ...prev]);
+      setNewName("");
+      setShowInput(false);
+    } finally {
+      setCreating(false);
+    }
+  };
 
   return (
     <View style={styles.section}>
@@ -408,17 +520,70 @@ function LibraryScreen({ playlists, showInput, name, onName, onAdd, onShowInput,
           <Text style={styles.kicker}>YOUR SPACE</Text>
           <Text style={styles.heading}>Library</Text>
         </View>
-        <Pressable testID="library-add-playlist" onPress={onShowInput} accessibilityRole="button" style={[styles.addButton, { backgroundColor: colors.brandPrimary }]}>
+        <Pressable testID="library-add-playlist" onPress={() => setShowInput(true)} accessibilityRole="button" style={[styles.addButton, { backgroundColor: colors.brandPrimary }]}>
           <MaterialCommunityIcons name="plus" size={21} color={colors.onBrandPrimary} />
         </Pressable>
       </View>
-      <Text style={styles.sectionTitle}>Liked songs</Text>
+
+      {showInput ? (
+        <View style={styles.playlistInputRow}>
+          <TextInput autoFocus value={newName} onChangeText={setNewName} onSubmitEditing={createPlaylist} placeholder="Playlist name" placeholderTextColor={colors.muted} style={styles.playlistInput} />
+          <Pressable testID="library-create-confirm" onPress={createPlaylist} disabled={creating} style={[styles.smallButton, { backgroundColor: colors.brandPrimary }]}>
+            {creating ? <ActivityIndicator color={colors.onBrandPrimary} /> : <Text style={[styles.smallButtonText, { color: colors.onBrandPrimary }]}>Create</Text>}
+          </Pressable>
+        </View>
+      ) : null}
+
+      <Text style={styles.sectionTitle}>Playlists</Text>
       {loading ? (
         <ActivityIndicator color={colors.brandPrimary} style={styles.loader} />
-      ) : liked.length ? (
+      ) : playlists.length ? (
+        <View style={styles.trackList}>
+          {playlists.map((pl) => (
+            <Pressable key={pl.id} testID={`playlist-open-${pl.id}`} onPress={() => onOpenPlaylist(pl)} style={({ pressed }) => [styles.libraryRow, pressed && styles.pressed]}>
+              <View style={[styles.rowIcon, { backgroundColor: colors.brandTertiary }]}>
+                <MaterialCommunityIcons name="playlist-music" size={21} color={colors.onBrandTertiary} />
+              </View>
+              <View style={styles.rowCopy}>
+                <Text style={styles.rowTitle}>{pl.name}</Text>
+                <Text style={styles.rowSubtitle}>{pl.track_count ?? 0} tracks</Text>
+              </View>
+              <MaterialCommunityIcons name="chevron-right" size={21} color={colors.muted} />
+            </Pressable>
+          ))}
+        </View>
+      ) : (
+        <View style={[styles.emptyCard, { borderColor: colors.border, backgroundColor: colors.surfaceSecondary }]}>
+          <MaterialCommunityIcons name="playlist-plus" size={30} color={colors.brandPrimary} />
+          <Text style={styles.emptyText}>Create a playlist to start collecting tracks.</Text>
+        </View>
+      )}
+
+      <Text style={styles.sectionTitle}>Downloads</Text>
+      {downloads.length ? (
+        <View style={styles.trackList}>
+          {downloads.slice(0, 8).map((d) => (
+            <TrackRow
+              key={d.id}
+              item={{ id: d.id, title: d.title, artist: d.artist, art_url: d.art_url, stream_url: d.local_uri }}
+              onPlay={onPlay}
+              resolvingId={resolvingId}
+              liked={false}
+            />
+          ))}
+        </View>
+      ) : (
+        <View style={[styles.emptyCard, { borderColor: colors.border, backgroundColor: colors.surfaceSecondary }]}>
+          <MaterialCommunityIcons name="download" size={28} color={colors.brandPrimary} />
+          <Text style={styles.emptyText}>Tap Download on any track to keep it offline.</Text>
+        </View>
+      )}
+
+      <Text style={styles.sectionTitle}>Liked songs</Text>
+      {liked.length ? (
         <View style={styles.trackList}>
           {liked.slice(0, 10).map((item) => (
-            <TrackRow key={item.id} item={item} onPlay={onPlay} resolvingId={resolvingId} liked={true} />
+            <TrackRow key={item.id} item={item} onPlay={(t) => onPlay(t)} resolvingId={resolvingId} liked={true} />
           ))}
         </View>
       ) : (
@@ -430,51 +595,11 @@ function LibraryScreen({ playlists, showInput, name, onName, onAdd, onShowInput,
       <Text style={styles.sectionTitle}>Recently played</Text>
       {history.length ? (
         <View style={styles.trackList}>
-          {history.slice(0, 8).map((item) => (
-            <TrackRow key={`${item.id}-${item.title}`} item={item} onPlay={onPlay} resolvingId={resolvingId} liked={false} />
+          {history.slice(0, 8).map((item, idx) => (
+            <TrackRow key={`${item.id}-${idx}`} item={item} onPlay={(t) => onPlay(t)} resolvingId={resolvingId} liked={false} />
           ))}
         </View>
-      ) : (
-        <View style={[styles.emptyCard, { borderColor: colors.border, backgroundColor: colors.surfaceSecondary }]}>
-          <MaterialCommunityIcons name="history" size={28} color={colors.brandPrimary} />
-          <Text style={styles.emptyText}>Your recent plays will appear here.</Text>
-        </View>
-      )}
-      <View style={styles.listHeader}>
-        <Text style={styles.sectionTitle}>Playlists</Text>
-        <Text style={styles.count}>{playlists.length} created</Text>
-      </View>
-      {showInput ? (
-        <View style={styles.playlistInputRow}>
-          <TextInput autoFocus value={name} onChangeText={onName} onSubmitEditing={onAdd} placeholder="Playlist name" placeholderTextColor={colors.muted} style={styles.playlistInput} />
-          <Pressable onPress={onAdd} accessibilityRole="button" style={[styles.smallButton, { backgroundColor: colors.brandPrimary }]}>
-            <Text style={[styles.smallButtonText, { color: colors.onBrandPrimary }]}>Add</Text>
-          </Pressable>
-        </View>
       ) : null}
-      {playlists.length ? (
-        playlists.map((item) => (
-          <View key={item} style={styles.libraryRow}>
-            <View style={[styles.rowIcon, { backgroundColor: colors.brandTertiary }]}>
-              <MaterialCommunityIcons name="playlist-music" size={21} color={colors.onBrandTertiary} />
-            </View>
-            <View style={styles.rowCopy}>
-              <Text style={styles.rowTitle}>{item}</Text>
-              <Text style={styles.rowSubtitle}>Empty playlist</Text>
-            </View>
-            <MaterialCommunityIcons name="chevron-right" size={21} color={colors.muted} />
-          </View>
-        ))
-      ) : (
-        <View style={[styles.emptyCard, { borderColor: colors.border, backgroundColor: colors.surfaceSecondary }]}>
-          <MaterialCommunityIcons name="playlist-plus" size={30} color={colors.brandPrimary} />
-          <Text style={styles.emptyTitle}>Make it yours</Text>
-          <Text style={styles.emptyText}>Create a playlist for a mood or a moment.</Text>
-          <Pressable onPress={onShowInput} accessibilityRole="button" style={[styles.outlineButton, { borderColor: colors.brandPrimary }]}>
-            <Text style={[styles.outlineText, { color: colors.brandPrimary }]}>New playlist</Text>
-          </Pressable>
-        </View>
-      )}
     </View>
   );
 }
@@ -492,13 +617,13 @@ function SettingsScreen({ provider, saving, message, setProvider, saveProvider, 
         <View style={styles.settingsHeading}>
           <View>
             <Text style={styles.cardTitle}>Invidious / Piped endpoint</Text>
-            <Text style={styles.cardSubtitle}>ShriMusic uses YouTube Music by default. Point here to override.</Text>
+            <Text style={styles.cardSubtitle}>ShriMusic uses YouTube Music by default.</Text>
           </View>
           <View style={[styles.statusDot, { backgroundColor: provider.connected ? colors.brandPrimary : colors.muted }]} />
         </View>
-        <TextInput autoCapitalize="none" value={provider.endpoint} onChangeText={(value) => setProvider({ ...provider, endpoint: value })} placeholder="https://your-piped-instance" placeholderTextColor={colors.muted} style={styles.settingsInput} />
-        <TextInput autoCapitalize="none" value={provider.api_key} onChangeText={(value) => setProvider({ ...provider, api_key: value })} placeholder="API key (optional)" placeholderTextColor={colors.muted} style={styles.settingsInput} secureTextEntry />
-        <TextInput autoCapitalize="none" value={provider.fallback_endpoint} onChangeText={(value) => setProvider({ ...provider, fallback_endpoint: value })} placeholder="Fallback endpoint (optional)" placeholderTextColor={colors.muted} style={styles.settingsInput} />
+        <TextInput autoCapitalize="none" value={provider.endpoint} onChangeText={(v) => setProvider({ ...provider, endpoint: v })} placeholder="https://your-piped-instance" placeholderTextColor={colors.muted} style={styles.settingsInput} />
+        <TextInput autoCapitalize="none" value={provider.api_key} onChangeText={(v) => setProvider({ ...provider, api_key: v })} placeholder="API key (optional)" placeholderTextColor={colors.muted} style={styles.settingsInput} secureTextEntry />
+        <TextInput autoCapitalize="none" value={provider.fallback_endpoint} onChangeText={(v) => setProvider({ ...provider, fallback_endpoint: v })} placeholder="Fallback endpoint (optional)" placeholderTextColor={colors.muted} style={styles.settingsInput} />
         <Pressable testID="provider-save" onPress={() => void saveProvider()} disabled={saving} accessibilityRole="button" style={[styles.primaryButton, { backgroundColor: colors.brandPrimary }]}>
           {saving ? <ActivityIndicator color={colors.onBrandPrimary} /> : <Text style={[styles.primaryButtonText, { color: colors.onBrandPrimary }]}>Save connection</Text>}
         </Pressable>
@@ -537,16 +662,6 @@ function SettingsScreen({ provider, saving, message, setProvider, saveProvider, 
           <View style={[styles.toggleKnob, { backgroundColor: scheme === "dark" ? colors.onBrandPrimary : colors.muted, alignSelf: scheme === "dark" ? "flex-end" : "flex-start" }]} />
         </Pressable>
       </View>
-      <View style={[styles.optionRow, { borderBottomColor: colors.divider }]}>
-        <View style={[styles.optionIcon, { backgroundColor: colors.brandTertiary }]}>
-          <MaterialCommunityIcons name="lock-outline" size={20} color={colors.onBrandTertiary} />
-        </View>
-        <View style={styles.rowCopy}>
-          <Text style={styles.rowTitle}>Background playback</Text>
-          <Text style={styles.rowSubtitle}>Lock-screen controls are enabled</Text>
-        </View>
-        <MaterialCommunityIcons name="check-circle" size={22} color={colors.brandPrimary} />
-      </View>
       <Pressable testID="sign-out" onPress={onSignOut} accessibilityRole="button" style={styles.signOut}>
         <MaterialCommunityIcons name="logout" size={19} color={colors.error} />
         <Text style={[styles.signOutText, { color: colors.error }]}>Sign out</Text>
@@ -555,83 +670,40 @@ function SettingsScreen({ provider, saving, message, setProvider, saveProvider, 
   );
 }
 
-function PlayerSheet({ track, playing, onToggle, onClose, liked, onLike }: { track: Track | null; playing: boolean; onToggle: () => void; onClose: () => void; liked: boolean; onLike: () => void }) {
-  const { colors } = useTheme();
-  const styles = useStyles();
-  return (
-    <View testID="player-sheet" style={[styles.playerOverlay, { backgroundColor: colors.surface }]}>
-      <View style={[styles.playerTop, { paddingTop: 18 }]}>
-        <Pressable testID="player-close" accessibilityRole="button" onPress={onClose} style={styles.closeButton}>
-          <MaterialCommunityIcons name="chevron-down" size={28} color={colors.onSurface} />
-        </Pressable>
-        <Text style={styles.playerTopText}>NOW PLAYING</Text>
-        <MaterialCommunityIcons name="dots-horizontal" size={24} color={colors.onSurface} />
-      </View>
-      <View style={styles.playerBody}>
-        {track ? (
-          <AlbumArt size={280} icon="music-note" url={track.art_url} />
-        ) : (
-          <View style={[styles.playerEmptyArt, { backgroundColor: colors.surfaceSecondary }]}>
-            <MaterialCommunityIcons name="music-note-off" size={64} color={colors.brandPrimary} />
-          </View>
-        )}
-        <Text style={styles.playerTitle}>{track?.title ?? "Nothing playing"}</Text>
-        <Text style={styles.playerArtist}>{track?.artist ?? "Tap a song to start"}</Text>
-        <View style={[styles.progress, { backgroundColor: colors.surfaceTertiary }]}>
-          <View style={[styles.progressFill, { backgroundColor: colors.brandPrimary, width: track ? "42%" : "0%" }]} />
-        </View>
-        <View style={styles.controls}>
-          <Pressable onPress={onLike} disabled={!track} hitSlop={8}>
-            <MaterialCommunityIcons name={liked ? "heart" : "heart-outline"} size={26} color={liked ? colors.brandPrimary : colors.muted} />
-          </Pressable>
-          <Pressable testID="player-toggle" onPress={onToggle} disabled={!track?.stream_url} style={[styles.playButton, { backgroundColor: colors.onSurface }, !track?.stream_url && styles.disabled]}>
-            <MaterialCommunityIcons name={playing ? "pause" : "play"} size={30} color={colors.surface} />
-          </Pressable>
-          <MaterialCommunityIcons name="repeat" size={23} color={colors.muted} />
-        </View>
-      </View>
-    </View>
-  );
-}
-
 const useStyles = makeStyles((colors) => ({
   root: { flex: 1, backgroundColor: colors.surface },
   scroll: { paddingHorizontal: 20 },
   section: { gap: 18 },
+  brandLine: { flex: 1, alignItems: "flex-start" },
+  brandLogo: { width: 170, height: 42 },
   topline: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   kicker: { color: colors.brandPrimary, fontSize: 11, fontWeight: "800", letterSpacing: 1.5 },
-  heading: { color: colors.onSurface, fontSize: 28, fontWeight: "800", letterSpacing: -0.7, marginTop: 5 },
+  heading: { color: colors.onSurface, fontSize: 26, fontWeight: "800", letterSpacing: -0.6, marginTop: 5 },
   avatar: { width: 42, height: 42, borderRadius: 15, alignItems: "center", justifyContent: "center" },
   avatarText: { fontSize: 17, fontWeight: "800" },
-  hero: { borderRadius: 24, padding: 22, minHeight: 200, overflow: "hidden", justifyContent: "flex-end" },
+  hero: { borderRadius: 24, padding: 22, minHeight: 150, overflow: "hidden", justifyContent: "flex-end" },
   heroGlow: { position: "absolute", right: 24, top: 22, opacity: 0.65 },
   heroEyebrow: { fontSize: 11, letterSpacing: 1.5, fontWeight: "800" },
-  heroTitle: { fontSize: 22, lineHeight: 28, fontWeight: "800", maxWidth: 280, marginTop: 8 },
-  heroText: { fontSize: 13, lineHeight: 19, maxWidth: 280, marginTop: 8, opacity: 0.9 },
-  sectionTitle: { color: colors.onSurface, fontSize: 19, fontWeight: "800", marginTop: 4 },
-  emptyCard: { borderWidth: 1, borderRadius: 20, padding: 23, alignItems: "center", gap: 9 },
-  emptyTitle: { color: colors.onSurface, fontSize: 18, fontWeight: "800", textAlign: "center" },
+  heroTitle: { fontSize: 20, lineHeight: 26, fontWeight: "800", maxWidth: 280, marginTop: 8 },
+  sectionTitle: { color: colors.onSurface, fontSize: 18, fontWeight: "800", marginTop: 4 },
+  emptyCard: { borderWidth: 1, borderRadius: 20, padding: 22, alignItems: "center", gap: 8 },
   emptyText: { color: colors.muted, fontSize: 14, lineHeight: 20, textAlign: "center", maxWidth: 300 },
-  outlineButton: { minHeight: 42, borderRadius: 999, borderWidth: 1, paddingHorizontal: 17, alignItems: "center", justifyContent: "center", marginTop: 7 },
-  outlineText: { fontWeight: "800", fontSize: 13 },
   searchBox: { minHeight: 56, borderRadius: 16, borderWidth: 1, flexDirection: "row", alignItems: "center", paddingHorizontal: 16, gap: 10 },
   searchInput: { flex: 1, color: colors.onSurface, fontSize: 16 },
   loader: { marginTop: 30 },
   addButton: { width: 42, height: 42, borderRadius: 15, alignItems: "center", justifyContent: "center" },
   trackList: { gap: 4 },
-  trackRow: { minHeight: 68, flexDirection: "row", alignItems: "center", gap: 6 },
+  trackRow: { minHeight: 68, flexDirection: "row", alignItems: "center", gap: 4 },
   trackPressable: { flex: 1, flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 6 },
   trackCopy: { flex: 1, gap: 3 },
   trackTitle: { color: colors.onSurface, fontSize: 15, fontWeight: "700" },
   trackArtist: { color: colors.muted, fontSize: 12 },
-  trackLike: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
-  libraryRow: { minHeight: 70, flexDirection: "row", alignItems: "center", gap: 13, paddingVertical: 8 },
+  trackAction: { width: 36, height: 40, alignItems: "center", justifyContent: "center" },
+  libraryRow: { minHeight: 70, flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 8 },
   rowIcon: { width: 46, height: 46, borderRadius: 14, alignItems: "center", justifyContent: "center" },
-  rowCopy: { flex: 1, gap: 4 },
+  rowCopy: { flex: 1, gap: 3 },
   rowTitle: { color: colors.onSurface, fontSize: 15, fontWeight: "700" },
   rowSubtitle: { color: colors.muted, fontSize: 12 },
-  listHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 4 },
-  count: { color: colors.muted, fontSize: 12 },
   playlistInputRow: { flexDirection: "row", gap: 9 },
   playlistInput: { flex: 1, minHeight: 48, backgroundColor: colors.surfaceTertiary, borderRadius: 13, paddingHorizontal: 14, color: colors.onSurface, fontSize: 15 },
   smallButton: { minHeight: 48, borderRadius: 13, paddingHorizontal: 17, alignItems: "center", justifyContent: "center" },
@@ -665,17 +737,4 @@ const useStyles = makeStyles((colors) => ({
   tabItem: { minWidth: 64, minHeight: 48, alignItems: "center", justifyContent: "center", gap: 3 },
   tabLabel: { fontSize: 10, fontWeight: "700" },
   pressed: { opacity: 0.75, transform: [{ scale: 0.98 }] },
-  disabled: { opacity: 0.5 },
-  playerOverlay: { ...StyleSheet.absoluteFillObject, zIndex: 20, paddingHorizontal: 24 },
-  playerTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  closeButton: { width: 44, height: 44, alignItems: "flex-start", justifyContent: "center" },
-  playerTopText: { color: colors.muted, fontSize: 11, fontWeight: "800", letterSpacing: 1.5 },
-  playerBody: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12 },
-  playerEmptyArt: { width: 280, height: 280, borderRadius: 40, alignItems: "center", justifyContent: "center" },
-  playerTitle: { color: colors.onSurface, fontSize: 23, fontWeight: "800", textAlign: "center", marginTop: 10 },
-  playerArtist: { color: colors.muted, fontSize: 14, textAlign: "center" },
-  progress: { height: 4, borderRadius: 2, alignSelf: "stretch", marginTop: 24, overflow: "hidden" },
-  progressFill: { height: 4, borderRadius: 2 },
-  controls: { width: "78%", flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 20 },
-  playButton: { width: 64, height: 64, borderRadius: 32, alignItems: "center", justifyContent: "center" },
 }));
